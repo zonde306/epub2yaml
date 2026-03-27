@@ -65,11 +65,12 @@ class YamlStore:
 
             item_key = str(item[match_key])
             if item_key in index_by_key:
-                existing_items[index_by_key[item_key]] = item
+                existing_index = index_by_key[item_key]
+                existing_items[existing_index] = self._merge_node(existing_items[existing_index], item)
                 stats.replaced_nodes += 1
             else:
                 index_by_key[item_key] = len(existing_items)
-                existing_items.append(item)
+                existing_items.append(self._clone_node(item))
                 stats.appended_nodes += 1
 
         merged = dict(current_data)
@@ -83,3 +84,25 @@ class YamlStore:
             sort_keys=False,
             indent=2,
         ).strip()
+
+    def _merge_node(self, current: Any, incoming: Any) -> Any:
+        if isinstance(current, dict) and isinstance(incoming, dict):
+            merged = {key: self._clone_node(value) for key, value in current.items()}
+            for key, value in incoming.items():
+                if key in merged:
+                    merged[key] = self._merge_node(merged[key], value)
+                else:
+                    merged[key] = self._clone_node(value)
+            return merged
+
+        if isinstance(incoming, list):
+            return [self._clone_node(item) for item in incoming]
+
+        return self._clone_node(incoming)
+
+    def _clone_node(self, node: Any) -> Any:
+        if isinstance(node, dict):
+            return {key: self._clone_node(value) for key, value in node.items()}
+        if isinstance(node, list):
+            return [self._clone_node(item) for item in node]
+        return node

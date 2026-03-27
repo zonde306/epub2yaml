@@ -198,7 +198,8 @@ class TaskRunner:
                     self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
-                validation_result = self.schema_validator.validate_increment(parsed_yaml, schema_definition)
+                sanitized_yaml = self.schema_validator.sanitize_increment_data(parsed_yaml)
+                validation_result = self.schema_validator.validate_increment(sanitized_yaml, schema_definition)
                 if not validation_result.ok:
                     last_error = validation_result.summary()
                     self._log(task, f"schema validation failed error={last_error}")
@@ -212,7 +213,7 @@ class TaskRunner:
                     self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
-                merged_data, merge_stats = self.yaml_store.merge_increment(current_output, parsed_yaml, schema_definition)
+                merged_data, merge_stats = self.yaml_store.merge_increment(current_output, sanitized_yaml, schema_definition)
                 self.yaml_store.write_yaml(task.output_path, merged_data)
                 self._log(
                     task,

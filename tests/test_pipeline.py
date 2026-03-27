@@ -105,10 +105,67 @@ class SchemaValidatorTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.errors)
 
+    def test_sanitize_increment_data_removes_empty_values_and_trims_strings(self) -> None:
+        payload = {
+            "worldinfo": [
+                {
+                    "name": "  黑风寨  ",
+                    "trigger_keywords": [" 黑风寨 ", "   ", None],
+                    "content": "   ",
+                    "metadata": {},
+                    "enabled": False,
+                    "priority": 0,
+                    "notes": {
+                        "summary": "  山寨势力  ",
+                        "empty_text": "\n\t",
+                        "empty_list": [],
+                    },
+                },
+                {
+                    "name": "   ",
+                    "content": None,
+                },
+            ],
+            "other": {},
+        }
+
+        sanitized = self.validator.sanitize_increment_data(payload)
+
+        self.assertEqual(
+            sanitized,
+            {
+                "worldinfo": [
+                    {
+                        "name": "黑风寨",
+                        "trigger_keywords": ["黑风寨"],
+                        "enabled": False,
+                        "priority": 0,
+                        "notes": {"summary": "山寨势力"},
+                    }
+                ]
+            },
+        )
+
     def test_validate_increment_accepts_empty_list(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
 
         result = self.validator.validate_increment({"worldinfo": []}, schema)
+
+        self.assertTrue(result.ok)
+
+    def test_validate_increment_accepts_partial_update_after_sanitize(self) -> None:
+        schema = self.loader.load(Path("schemas/world.yaml"))
+        payload = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "content": "位于山谷中的势力。",
+                }
+            ]
+        }
+
+        sanitized = self.validator.sanitize_increment_data(payload)
+        result = self.validator.validate_increment(sanitized, schema)
 
         self.assertTrue(result.ok)
 
@@ -136,6 +193,22 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertTrue(any(error.path == "actors" for error in result.errors))
+
+    def test_validate_increment_rejects_unexpected_field(self) -> None:
+        schema = self.loader.load(Path("schemas/world.yaml"))
+        payload = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "unknown": "x",
+                }
+            ]
+        }
+
+        result = self.validator.validate_increment(payload, schema)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(any(error.path.endswith(".unknown") for error in result.errors))
 
 
 class PromptBuilderTests(unittest.TestCase):
@@ -169,6 +242,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("root=worldinfo", prompt)
         self.assertIn("error=schema validation failed", prompt)
         self.assertIn("顶层只能包含 `worldinfo`", prompt)
+        self.assertIn("允许只返回新增或更新过的字段", prompt)
 
 
 class YamlStoreTests(unittest.TestCase):
@@ -176,13 +250,14 @@ class YamlStoreTests(unittest.TestCase):
         self.store = YamlStore()
         self.schema = SchemaLoader().load(Path("schemas/world.yaml"))
 
-    def test_merge_increment_replaces_and_appends_nodes(self) -> None:
+    def test_merge_increment_merges_and_appends_nodes(self) -> None:
         current = {
             "worldinfo": [
                 {
                     "name": "黑风寨",
                     "trigger_keywords": ["旧关键字"],
                     "content": "旧内容",
+                    "type": "势力",
                 }
             ]
         }
@@ -207,7 +282,66 @@ class YamlStoreTests(unittest.TestCase):
         self.assertEqual(stats.appended_nodes, 1)
         self.assertEqual(len(merged["worldinfo"]), 2)
         self.assertEqual(merged["worldinfo"][0]["content"], "新内容")
+        self.assertEqual(merged["worldinfo"][0]["type"], "势力")
         self.assertEqual(merged["worldinfo"][1]["name"], "青石镇")
+
+    def test_merge_increment_recursively_merges_nested_dicts(self) -> None:
+        current = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "details": {
+                        "summary": "旧摘要",
+                        "extra": {"region": "北境", "climate": "寒冷"},
+                    },
+                }
+            ]
+        }
+        increment = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "details": {
+                        "summary": "新摘要",
+                        "extra": {"region": "西境"},
+                    },
+                }
+            ]
+        }
+
+        merged, stats = self.store.merge_increment(current, increment, self.schema)
+
+        self.assertEqual(stats.replaced_nodes, 1)
+        self.assertEqual(
+            merged["worldinfo"][0]["details"],
+            {
+                "summary": "新摘要",
+                "extra": {"region": "西境", "climate": "寒冷"},
+            },
+        )
+
+    def test_merge_increment_replaces_lists_as_a_whole(self) -> None:
+        current = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "trigger_keywords": ["旧关键字", "别名"],
+                }
+            ]
+        }
+        increment = {
+            "worldinfo": [
+                {
+                    "name": "黑风寨",
+                    "trigger_keywords": ["新关键字"],
+                }
+            ]
+        }
+
+        merged, stats = self.store.merge_increment(current, increment, self.schema)
+
+        self.assertEqual(stats.replaced_nodes, 1)
+        self.assertEqual(merged["worldinfo"][0]["trigger_keywords"], ["新关键字"])
 
     def test_merge_increment_requires_match_key(self) -> None:
         with self.assertRaises(ValueError):
