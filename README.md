@@ -9,6 +9,8 @@
 - 使用 `prompts/` 模板构造提示词
 - 支持流式缓冲、最小结构校验、增量替换合并、状态落盘与恢复
 - 已支持 OpenAI-compatible Chat Completions 流式 API 接入
+- 已提供初始化 / 添加 EPUB / 运行 / 测试命令，降低手动操作成本
+- 已增强控制台日志与文件日志，便于定位错误原因
 
 当前版本已经完成 MVP 骨架、基础测试、本地可运行入口，以及真实 API 客户端接入。
 
@@ -24,10 +26,11 @@
 - `workspace/`：运行时工作区，按 EPUB 隔离
 - `tests/`：单元测试
 - `config.yaml`：运行配置
+- `config.example.yaml`：示例配置
 
 核心模块：
 
-- `src/app.py`：程序入口
+- `src/app.py`：程序入口与命令行子命令
 - `src/task_runner.py`：单个 `EPUB × schema` 任务执行器
 - `src/epub_reader.py`：EPUB 章节提取
 - `src/schema_loader.py`：schema 装载与字段提取
@@ -56,7 +59,11 @@
 pip install pyyaml lxml
 ```
 
-当前 API 接入基于 Python 标准库 `urllib`，因此不强制依赖额外 HTTP SDK。
+当前 API 接入基于 `httpx`，建议安装依赖时一并执行：
+
+```bash
+pip install pyyaml lxml httpx
+```
 
 ---
 
@@ -75,6 +82,7 @@ pip install pyyaml lxml
 - 模板顺序尝试
 - 有界重试骨架
 - OpenAI-compatible 流式 API 接入
+- 命令行初始化 / 添加输入 / 运行 / 测试
 - 单元测试
 
 ### 尚未实现 / 仍待增强
@@ -179,7 +187,114 @@ progress:
 
 ---
 
-## 5. 输入准备
+## 5. 命令行使用方式
+
+入口文件已经支持子命令，统一通过 [`src/app.py`](src/app.py) 调用。
+
+基础格式：
+
+```bash
+python src/app.py [--config config.yaml] <command>
+```
+
+如果不写 `<command>`，默认等价于 `run`。
+
+### 5.1 初始化项目
+
+创建默认配置、`input/` 目录和 `workspace/` 目录：
+
+```bash
+python src/app.py init
+```
+
+如果要强制用 [`config.example.yaml`](config.example.yaml) 或默认模板覆盖当前配置：
+
+```bash
+python src/app.py init --force
+```
+
+### 5.2 添加 EPUB 到输入目录并写入配置
+
+```bash
+python src/app.py add-epub tests/给了失去一切卖身的少女一切的结果.epub
+```
+
+该命令会自动完成两件事：
+
+1. 把 EPUB 复制到 `input/` 目录
+2. 把复制后的路径追加到 [`config.yaml`](config.yaml) 的 `input_epubs`
+
+因此不再需要手动复制文件和手动改配置。
+
+### 5.3 运行抽取任务
+
+```bash
+python src/app.py run
+```
+
+或者直接：
+
+```bash
+python src/app.py
+```
+
+如果使用其他配置文件：
+
+```bash
+python src/app.py --config config.example.yaml run
+```
+
+### 5.4 运行测试
+
+```bash
+python src/app.py test
+```
+
+这个命令会内部调用：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+---
+
+## 6. 推荐的一键操作流程
+
+首次使用建议按下面顺序执行：
+
+### 步骤 1：初始化
+
+```bash
+python src/app.py init
+```
+
+### 步骤 2：加入一本 EPUB
+
+```bash
+python src/app.py add-epub tests/文件.epub
+```
+
+### 步骤 3：编辑 API 配置
+
+打开 [`config.yaml`](config.yaml)，填写：
+
+- `model.base_url`
+- `model.api_key`
+- 如有需要，修改 `model.name`
+
+### 步骤 4：运行任务
+
+```bash
+python src/app.py run
+```
+
+### 步骤 5：查看结果
+
+输出会出现在 `workspace/<epub_name>/` 目录下。
+
+---
+
+## 7. 输入准备
 
 建议目录结构如下：
 
@@ -189,7 +304,9 @@ input/
   other_novel.epub
 ```
 
-然后在 `config.yaml` 中填写：
+如果你使用的是 [`add-epub`](src/app.py) 命令，则无需手动创建这个结构，程序会自动准备。
+
+如果仍想手动配置，也可以在 [`config.yaml`](config.yaml) 中填写：
 
 ```yaml
 input_epubs:
@@ -197,21 +314,11 @@ input_epubs:
   - input/other_novel.epub
 ```
 
-如果 `input/` 目录还不存在，可以自行创建。
-
 ---
 
-## 6. 运行方式
+## 8. 运行结果说明
 
-在项目根目录执行：
-
-```bash
-python src/app.py
-```
-
-### 运行结果说明
-
-#### 情况 1：未配置 `input_epubs`
+### 情况 1：未配置 `input_epubs`
 程序会输出：
 
 ```text
@@ -220,10 +327,10 @@ No tasks found. Please check config.yaml input_epubs and schema_paths.
 
 这属于正常行为，表示配置里没有待处理任务。
 
-#### 情况 2：已配置 EPUB，但 `model.api_key` 为空
+### 情况 2：已配置 EPUB，但 `model.api_key` 为空
 程序会使用占位客户端打通处理流程，输出通常是空增量结果，主要用于验证目录、状态文件和流程逻辑。
 
-#### 情况 3：已配置 EPUB，且 `model.api_key` 有效
+### 情况 3：已配置 EPUB，且 `model.api_key` 有效
 程序会：
 
 1. 为每个 EPUB 创建独立工作区
@@ -235,12 +342,90 @@ No tasks found. Please check config.yaml input_epubs and schema_paths.
 控制台会打印类似进度信息：
 
 ```text
-[novel][characters] 1/120 template=base status=running retries=0 replaced=0 appended=0
+[2026-03-27 17:00:00] [epub][characters] chapter attempt chapter=1/3 retry=1/3 template=base
+[2026-03-27 17:00:01] [epub][characters] stream failed: http error 401: unauthorized
+[epub][characters] 0/3 template=base status=running retries=0 replaced=0 appended=0 last_error=stream failed: http error 401: unauthorized
 ```
+
+相比之前只显示 `status=failed`，现在会直接带出关键错误原因。
 
 ---
 
-## 7. 工作区结构说明
+## 9. 日志与错误排查
+
+这是当前版本新增的重要能力。
+
+### 9.1 控制台阶段日志
+
+现在运行时会输出更详细的阶段日志，例如：
+
+- `task started`
+- `task prepared`
+- `chapter start`
+- `chapter attempt`
+- `stream completed`
+- `yaml parse failed`
+- `schema validation failed`
+- `merge completed`
+- `chapter completed`
+- `chapter failed`
+- `task failed`
+
+这样即使失败，也能直接看到失败发生在哪个阶段。
+
+### 9.2 进度行中的错误摘要
+
+[`TaskRunner._emit_progress()`](src/task_runner.py:228) 现在会把 `last_error` 一并输出到控制台。
+
+例如：
+
+```text
+[epub][characters] 0/3 template=failed status=failed retries=3 replaced=0 appended=0 last_error=stream failed: http error 403: Access denied | hajimi.zabc.net used Cloudflare to restrict access | hajimi.zabc.net | Cloudflare | The owner of this website has banned your access...
+```
+
+### 9.3 文件日志
+
+每个任务都会写入工作区日志文件：
+
+```text
+workspace/<epub_name>/logs/run.log
+```
+
+日志由 [`TaskRunner._log()`](src/task_runner.py:250) 写入，可用于事后排查。
+
+### 9.4 状态文件中的错误
+
+任务状态文件仍会持续写入最近错误：
+
+```text
+workspace/<epub_name>/state/<schema>.progress.yaml
+```
+
+可以重点查看：
+
+- `status`
+- `retry.last_error`
+- `validation.last_result`
+- `stream.last_receive_status`
+
+### 9.5 推荐排查顺序
+
+如果看到：
+
+```text
+status=failed
+```
+
+建议按顺序查看：
+
+1. 控制台最近一条 `last_error`
+2. `workspace/<epub_name>/logs/run.log`
+3. `workspace/<epub_name>/state/*.progress.yaml`
+4. `workspace/<epub_name>/temp/*.stream.txt`
+
+---
+
+## 10. 工作区结构说明
 
 程序运行后，会在 `workspace/` 下生成按 EPUB 隔离的目录，例如：
 
@@ -281,7 +466,7 @@ workspace/
 
 ---
 
-## 8. 输出语义说明
+## 10. 输出语义说明
 
 当前采用的是**节点级增量替换**，不是字段级 patch。
 
@@ -312,9 +497,9 @@ workspace/
 
 ---
 
-## 9. 恢复机制说明
+## 11. 恢复机制说明
 
-当 `config.yaml` 中的 `runtime.resume: true` 时：
+当 [`config.yaml`](config.yaml) 中的 `runtime.resume: true` 时：
 
 - 若存在进度文件，则从 `last_completed_chapter_index` 的下一章继续
 - 若存在未完成的流式缓冲文件，则会先清理再重新处理当前章节
@@ -324,25 +509,25 @@ workspace/
 
 ---
 
-## 10. API 接入说明
+## 12. API 接入说明
 
 当前已经支持 OpenAI-compatible Chat Completions 流式接口。
 
 实现位置：
 
-- `src/llm_client.py`
-- `src/task_runner.py`
+- [`src/llm_client.py`](src/llm_client.py)
+- [`src/task_runner.py`](src/task_runner.py)
 
 ### 当前接入方式
 
-当 `TaskRunner` 初始化且未手动注入模型客户端时，会调用 `src/llm_client.py` 中的客户端构造逻辑：
+当 [`TaskRunner`](src/task_runner.py) 初始化且未手动注入模型客户端时，会调用 [`build_model_client()`](src/llm_client.py:94) 自动选择：
 
 - 若 `model.api_key` 非空，使用真实 API 客户端
 - 若 `model.api_key` 为空，使用占位客户端
 
 ### 真实客户端行为
 
-真实客户端会向以下地址发送请求：
+真实客户端现在基于 `httpx` 实现，会向以下地址发送请求：
 
 ```text
 {base_url}/chat/completions
@@ -382,9 +567,15 @@ model:
 
 ---
 
-## 11. 运行测试
+## 13. 运行测试
 
 执行单元测试：
+
+```bash
+python src/app.py test
+```
+
+或者：
 
 ```bash
 python -m unittest discover -s tests -v
@@ -399,52 +590,63 @@ python -m unittest discover -s tests -v
 - YAML 增量合并
 - API 客户端辅助函数
 - API 客户端构造逻辑
+- 命令入口相关行为的基础能力
 
 ---
 
-## 12. 常见问题
+## 14. 常见问题
 
 ### Q1：为什么运行后没有结果？
-通常是因为 `config.yaml` 中的 `input_epubs` 还是空列表。
+通常是因为 [`config.yaml`](config.yaml) 中的 `input_epubs` 还是空列表。
 
 ### Q2：为什么输出都是空列表？
 通常是因为 `model.api_key` 为空，系统回退到了占位客户端。
 
 ### Q3：为什么 `schemas/characters.yaml` 这种文件也能加载？
-因为 `src/schema_loader.py` 中增加了对说明性占位 schema 的回退解析逻辑，不完全依赖标准 `PyYAML` 成功解析。
+因为 [`src/schema_loader.py`](src/schema_loader.py) 中增加了对说明性占位 schema 的回退解析逻辑，不完全依赖标准 `PyYAML` 成功解析。
 
 ### Q4：为什么没有写入数据库？
 这是设计要求之一。当前版本状态全部落在文件系统中。
 
 ### Q5：可以只跑某一个 schema 吗？
-可以。只要在 `config.yaml` 的 `schema_paths` 中保留目标 schema 即可。
+可以。只要在 [`config.yaml`](config.yaml) 的 `schema_paths` 中保留目标 schema 即可。
 
 ### Q6：可以接入代理服务或兼容 OpenAI 协议的网关吗？
 可以。只要它支持 `/chat/completions` 的流式返回，并且 `base_url` 可配置即可。
 
+### Q7：怎样避免每次手动复制文件、改配置、再运行？
+使用下面三条命令即可：
+
+```bash
+python src/app.py init
+python src/app.py add-epub <你的epub路径>
+python src/app.py run
+```
+
 ---
 
-## 13. 推荐使用流程
+## 16. 推荐使用流程
 
 建议按下面的顺序使用：
 
-1. 准备一个或多个 EPUB 到 `input/`
-2. 修改 `config.yaml` 中的 `input_epubs`
-3. 先在不填 `api_key` 的情况下运行 `python src/app.py` 验证本地流程
-4. 确认 `workspace/` 结构、状态文件和输出文件都已生成
-5. 再填入真实 `api_key` 和 `base_url`
-6. 用单本 EPUB + 单个 schema 进行真实 API 联调
-7. 最后再开启多 EPUB / 多 schema 并发
+1. 执行 `python src/app.py init`
+2. 执行 `python src/app.py add-epub <epub路径>`
+3. 修改 [`config.yaml`](config.yaml) 中的 API 配置
+4. 执行 `python src/app.py run`
+5. 失败时优先查看控制台 `last_error`
+6. 再查看 `workspace/<epub_name>/logs/run.log`
+7. 必要时查看 `workspace/<epub_name>/state/*.progress.yaml`
+8. 需要自检时执行 `python src/app.py test`
 
 ---
 
-## 14. 后续扩展建议
+## 17. 后续扩展建议
 
 后续如果继续推进，可以优先做这些事情：
 
 1. 增加环境变量优先级与安全的密钥读取策略
 2. 支持更多 OpenAI-compatible 响应差异格式
-3. 完善 `logs/` 日志落盘
+3. 增加结构化日志级别（info / warning / error）
 4. 增强 schema 注释提取与错误摘要可读性
-5. 增加更多针对 `task_runner` 的集成测试
+5. 增加更多针对 [`task_runner`](src/task_runner.py) 的集成测试
 6. 再考虑是否引入 LangChain / LangGraph 封装

@@ -25,6 +25,9 @@ class WorkspaceManager:
         for directory in (self.workspace_root, root, source_dir, output_dir, state_dir, temp_dir, logs_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
+        debug_dir = logs_dir / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+
         source_copy_path = source_dir / epub_path.name
         if epub_path.exists() and not source_copy_path.exists():
             shutil.copy2(epub_path, source_copy_path)

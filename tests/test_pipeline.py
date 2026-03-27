@@ -22,6 +22,7 @@ from models import AppConfig, Chapter, PromptTemplate  # noqa: E402
 from prompt_builder import PromptBuilder  # noqa: E402
 from schema_loader import SchemaLoader  # noqa: E402
 from schema_validator import SchemaValidator  # noqa: E402
+from task_runner import TaskRunner  # noqa: E402
 from workspace_manager import WorkspaceManager, slugify_epub_name  # noqa: E402
 from yaml_store import YamlStore  # noqa: E402
 
@@ -47,6 +48,35 @@ class WorkspaceManagerTests(unittest.TestCase):
             self.assertTrue(workspace.temp_dir.exists())
             self.assertTrue(workspace.logs_dir.exists())
             self.assertTrue((workspace.source_dir / input_epub.name).exists())
+            self.assertTrue(workspace.debug_dir().exists())
+
+    def test_workspace_builds_debug_artifact_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace_root = root / "workspace"
+            input_epub = root / "示例 小说.epub"
+            input_epub.write_bytes(b"dummy")
+
+            manager = WorkspaceManager(workspace_root)
+            workspace = manager.ensure_workspace(input_epub)
+
+            prompt_path = workspace.prompt_debug_path_for_attempt(
+                schema_name="characters",
+                chapter_index=1,
+                retry_attempt=2,
+                template_name="retry_format",
+            )
+            response_path = workspace.response_debug_path_for_attempt(
+                schema_name="characters",
+                chapter_index=1,
+                retry_attempt=2,
+                template_name="retry_format",
+            )
+
+            self.assertEqual(prompt_path.parent, workspace.debug_dir())
+            self.assertEqual(response_path.parent, workspace.debug_dir())
+            self.assertEqual(prompt_path.name, "characters.ch0001.r02.retry_format.prompt.txt")
+            self.assertEqual(response_path.name, "characters.ch0001.r02.retry_format.response.yaml")
 
 
 class SchemaLoaderTests(unittest.TestCase):
@@ -186,6 +216,38 @@ class YamlStoreTests(unittest.TestCase):
                 {"worldinfo": [{"content": "缺少 name"}]},
                 self.schema,
             )
+
+
+class TaskRunnerTests(unittest.TestCase):
+    def test_collect_stream_writes_stream_and_debug_response_files(self) -> None:
+        class StubStreamModelClient:
+            def stream_yaml(self, prompt: str):
+                self.last_prompt = prompt
+                yield "worldinfo:\n"
+                yield "- name: 黑风寨\n"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace_root = root / "workspace"
+            config = AppConfig(
+                input_epubs=[],
+                schema_paths=[],
+                prompt_templates=[],
+                workspace_root=workspace_root,
+            )
+            client = StubStreamModelClient()
+            runner = TaskRunner(config, model_client=client)
+
+            stream_buffer_path = workspace_root / "epub" / "temp" / "world.stream.txt"
+            response_debug_path = workspace_root / "epub" / "logs" / "debug" / "world.ch0001.r01.base.response.yaml"
+
+            yaml_text, chunk_count = runner._collect_stream(stream_buffer_path, response_debug_path, "hello prompt")
+
+            self.assertEqual(client.last_prompt, "hello prompt")
+            self.assertEqual(chunk_count, 2)
+            self.assertEqual(yaml_text, "worldinfo:\n- name: 黑风寨\n")
+            self.assertEqual(stream_buffer_path.read_text(encoding="utf-8"), yaml_text)
+            self.assertEqual(response_debug_path.read_text(encoding="utf-8"), yaml_text)
 
 
 class LlmClientTests(unittest.TestCase):

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import argparse
+import shutil
+import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -11,15 +15,29 @@ from models import AppConfig
 from task_runner import TaskRunner
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
+DEFAULT_EXAMPLE_CONFIG_PATH = Path("config.example.yaml")
+DEFAULT_INPUT_DIR = Path("input")
+DEFAULT_WORKSPACE_DIR = Path("workspace")
+
+
+def load_raw_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict[str, Any]:
+    if not config_path.exists():
+        return {}
+    return yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+
+def save_raw_config(raw_config: dict[str, Any], config_path: Path = DEFAULT_CONFIG_PATH) -> None:
+    serialized = yaml.safe_dump(raw_config, allow_unicode=True, sort_keys=False, indent=2)
+    config_path.write_text(serialized, encoding="utf-8")
 
 
 def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
-    raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    raw = load_raw_config(config_path)
 
     input_epubs = [Path(value) for value in raw.get("input_epubs", [])]
     schema_paths = [Path(value) for value in raw.get("schema_paths", [])]
     prompt_templates = [Path(value) for value in raw.get("prompt_templates", [])]
-    workspace_root = Path(raw.get("workspace_root", "workspace"))
+    workspace_root = Path(raw.get("workspace_root", str(DEFAULT_WORKSPACE_DIR)))
 
     concurrency = raw.get("concurrency", {})
     model = raw.get("model", {})
@@ -45,8 +63,90 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     )
 
 
-def main() -> int:
-    config = load_config()
+def ensure_project_layout(config_path: Path = DEFAULT_CONFIG_PATH, *, force: bool = False) -> Path:
+    DEFAULT_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    DEFAULT_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if force or not config_path.exists():
+        template_path = DEFAULT_EXAMPLE_CONFIG_PATH if DEFAULT_EXAMPLE_CONFIG_PATH.exists() else DEFAULT_CONFIG_PATH
+        if template_path.exists() and template_path != config_path:
+            shutil.copy2(template_path, config_path)
+        elif not config_path.exists():
+            save_raw_config(default_raw_config(), config_path)
+
+    return config_path
+
+
+def default_raw_config() -> dict[str, Any]:
+    return {
+        "input_epubs": [],
+        "schema_paths": ["schemas/characters.yaml", "schemas/world.yaml"],
+        "prompt_templates": [
+            "prompts/base.md",
+            "prompts/retry_format.md",
+            "prompts/retry_schema.md",
+        ],
+        "workspace_root": "workspace",
+        "concurrency": {
+            "enable_parallel_tasks": True,
+            "task_unit": "epub_schema",
+            "max_workers": 4,
+        },
+        "model": {
+            "provider": "openai",
+            "name": "gpt-4.1",
+            "streaming": True,
+            "base_url": "https://api.openai.com/v1",
+            "api_key": "",
+        },
+        "runtime": {
+            "resume": True,
+            "retry_count": 3,
+            "retry_backoff_seconds": 3,
+        },
+        "progress": {
+            "emit_console_progress": True,
+        },
+    }
+
+
+def copy_epub_to_input(source_path: Path, input_dir: Path = DEFAULT_INPUT_DIR) -> Path:
+    if not source_path.exists() or not source_path.is_file():
+        raise FileNotFoundError(f"EPUB file not found: {source_path}")
+
+    input_dir.mkdir(parents=True, exist_ok=True)
+    target_path = input_dir / source_path.name
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
+def upsert_input_epub(raw_config: dict[str, Any], epub_path: Path) -> dict[str, Any]:
+    normalized = str(epub_path).replace("\\", "/")
+    input_epubs = list(raw_config.get("input_epubs", []))
+    if normalized not in input_epubs:
+        input_epubs.append(normalized)
+    raw_config["input_epubs"] = input_epubs
+    return raw_config
+
+
+def init_command(config_path: Path, *, force: bool = False) -> int:
+    created_config = ensure_project_layout(config_path, force=force)
+    print(f"项目初始化完成: config={created_config} input={DEFAULT_INPUT_DIR} workspace={DEFAULT_WORKSPACE_DIR}")
+    return 0
+
+
+def add_epub_command(config_path: Path, epub_source: Path) -> int:
+    ensure_project_layout(config_path)
+    raw_config = load_raw_config(config_path)
+    copied_path = copy_epub_to_input(epub_source)
+    upsert_input_epub(raw_config, copied_path)
+    save_raw_config(raw_config, config_path)
+    print(f"已加入 EPUB: {copied_path}")
+    return 0
+
+
+def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+    config = load_config(config_path)
     runner = TaskRunner(config)
     graph = ExtractorGraph(runner)
     tasks = runner.build_tasks()
@@ -70,6 +170,47 @@ def main() -> int:
     completed_count = sum(1 for result in results if result.get("status") == "completed")
     print(f"Finished tasks: completed={completed_count} failed={failed_count} total={len(results)}")
     return 0 if failed_count == 0 else 2
+
+
+def test_command() -> int:
+    completed = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], check=False)
+    return int(completed.returncode)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="EPUB LLM extraction helper commands")
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG_PATH), help="config file path")
+
+    subparsers = parser.add_subparsers(dest="command")
+
+    init_parser = subparsers.add_parser("init", help="create default config and runtime directories")
+    init_parser.add_argument("--force", action="store_true", help="overwrite config file with example/default content")
+
+    add_epub_parser = subparsers.add_parser("add-epub", help="copy an epub into input directory and register it in config")
+    add_epub_parser.add_argument("epub_path", help="path to the epub file to add")
+
+    subparsers.add_parser("run", help="run extraction tasks from config")
+    subparsers.add_parser("test", help="run unit tests")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config_path = Path(args.config)
+
+    if args.command in (None, "run"):
+        return run_command(config_path)
+    if args.command == "init":
+        return init_command(config_path, force=bool(args.force))
+    if args.command == "add-epub":
+        return add_epub_command(config_path, Path(args.epub_path))
+    if args.command == "test":
+        return test_command()
+
+    parser.print_help()
+    return 1
 
 
 if __name__ == "__main__":

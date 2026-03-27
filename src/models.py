@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from typing import Any, Protocol
 
 
@@ -37,6 +38,57 @@ class WorkspacePaths:
 
     def log_path(self) -> Path:
         return self.logs_dir / "run.log"
+
+    def debug_dir(self) -> Path:
+        return self.logs_dir / "debug"
+
+    def prompt_debug_path_for_attempt(
+        self,
+        schema_name: str,
+        chapter_index: int,
+        retry_attempt: int,
+        template_name: str,
+    ) -> Path:
+        return self.debug_dir() / build_debug_artifact_name(
+            schema_name=schema_name,
+            chapter_index=chapter_index,
+            retry_attempt=retry_attempt,
+            template_name=template_name,
+            suffix="prompt.txt",
+        )
+
+    def response_debug_path_for_attempt(
+        self,
+        schema_name: str,
+        chapter_index: int,
+        retry_attempt: int,
+        template_name: str,
+    ) -> Path:
+        return self.debug_dir() / build_debug_artifact_name(
+            schema_name=schema_name,
+            chapter_index=chapter_index,
+            retry_attempt=retry_attempt,
+            template_name=template_name,
+            suffix="response.yaml",
+        )
+
+
+def build_debug_artifact_name(
+    *,
+    schema_name: str,
+    chapter_index: int,
+    retry_attempt: int,
+    template_name: str,
+    suffix: str,
+) -> str:
+    safe_schema = normalize_debug_token(schema_name)
+    safe_template = normalize_debug_token(template_name)
+    return f"{safe_schema}.ch{chapter_index:04d}.r{retry_attempt:02d}.{safe_template}.{suffix}"
+
+
+def normalize_debug_token(value: str) -> str:
+    normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower())
+    return normalized.strip("-._") or "value"
 
 
 @dataclass(slots=True)

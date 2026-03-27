@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -60,19 +61,30 @@ class TaskRunner:
         return tasks
 
     def run_task(self, task: TaskDefinition) -> dict[str, Any]:
+        self._log(task, f"task started epub={task.epub_path} schema={task.schema_path}")
         chapters = extract_epub(str(task.epub_path))
         schema_definition = self.schema_loader.load(task.schema_path)
         prompt_templates = self.prompt_loader.load_templates(task.prompt_template_paths)
         self.yaml_store.initialize_output(task.output_path, schema_definition)
         progress = self._load_or_initialize_progress(task, total_chapters=len(chapters))
 
+        self._log(
+            task,
+            f"task prepared total_chapters={len(chapters)} output={task.output_path} progress={task.progress_path}",
+        )
+
         if self.config.resume and task.stream_buffer_path.exists():
             self.workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
+            self._log(task, f"removed stale stream buffer path={task.stream_buffer_path}")
 
         start_index = int(progress.get("last_completed_chapter_index", 0))
         existing_worldinfo = self._load_existing_worldinfo(task)
 
         for chapter in chapters[start_index:]:
+            self._log(
+                task,
+                f"chapter start chapter={chapter.chapter_index}/{len(chapters)} chapter_id={chapter.chapter_id} title={chapter.title}",
+            )
             chapter_result = self._run_chapter(
                 task,
                 chapter=chapter,
@@ -84,11 +96,13 @@ class TaskRunner:
             )
             progress = chapter_result["progress"]
             if progress.get("status") == "failed":
+                self._log(task, f"task failed last_error={self._last_error(progress)}")
                 return progress
 
         if progress.get("status") != "failed":
             progress["status"] = "completed"
             self.progress_store.save(task.progress_path, progress)
+            self._log(task, "task completed")
         return progress
 
     def _run_chapter(
@@ -109,6 +123,10 @@ class TaskRunner:
             attempted_templates: list[str] = []
             for template in prompt_templates:
                 attempted_templates.append(str(template.path).replace("\\", "/"))
+                self._log(
+                    task,
+                    f"chapter attempt chapter={chapter.chapter_index}/{total_chapters} retry={chapter_retry + 1}/{self.config.retry_count} template={template.name}",
+                )
                 progress = self.progress_store.update_running(
                     progress,
                     chapter_index=chapter.chapter_index,
@@ -131,20 +149,45 @@ class TaskRunner:
                     existing_worldinfo=existing_worldinfo,
                     error_summary=last_error,
                 )
+                prompt_debug_path = task.workspace.prompt_debug_path_for_attempt(
+                    schema_name=schema_definition.schema_name,
+                    chapter_index=chapter.chapter_index,
+                    retry_attempt=chapter_retry + 1,
+                    template_name=template.name,
+                )
+                response_debug_path = task.workspace.response_debug_path_for_attempt(
+                    schema_name=schema_definition.schema_name,
+                    chapter_index=chapter.chapter_index,
+                    retry_attempt=chapter_retry + 1,
+                    template_name=template.name,
+                )
+                self._write_text(prompt_debug_path, prompt)
+                self._log(
+                    task,
+                    f"debug capture prompt={prompt_debug_path} response={response_debug_path}",
+                )
 
                 try:
-                    yaml_text, chunk_count = self._collect_stream(task.stream_buffer_path, prompt)
+                    yaml_text, chunk_count = self._collect_stream(
+                        task.stream_buffer_path,
+                        response_debug_path,
+                        prompt,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     last_error = f"stream failed: {exc}"
+                    self._log(task, last_error)
                     progress = self.progress_store.update_stream(progress, receive_status="interrupted", chunk_count=0)
                     progress = self.progress_store.update_validation(progress, result="failed", error_count=1, last_error=last_error)
                     self.progress_store.save(task.progress_path, progress)
+                    self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
+                self._log(task, f"stream completed chunk_count={chunk_count}")
                 progress = self.progress_store.update_stream(progress, receive_status="completed", chunk_count=chunk_count)
                 parsed_yaml, parse_result = self.schema_validator.parse_yaml_text(yaml_text)
                 if not parse_result.ok or parsed_yaml is None:
                     last_error = parse_result.summary()
+                    self._log(task, f"yaml parse failed error={last_error}")
                     progress = self.progress_store.update_validation(
                         progress,
                         result="failed",
@@ -152,11 +195,13 @@ class TaskRunner:
                         last_error=last_error,
                     )
                     self.progress_store.save(task.progress_path, progress)
+                    self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
                 validation_result = self.schema_validator.validate_increment(parsed_yaml, schema_definition)
                 if not validation_result.ok:
                     last_error = validation_result.summary()
+                    self._log(task, f"schema validation failed error={last_error}")
                     progress = self.progress_store.update_validation(
                         progress,
                         result="failed",
@@ -164,10 +209,15 @@ class TaskRunner:
                         last_error=last_error,
                     )
                     self.progress_store.save(task.progress_path, progress)
+                    self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
                 merged_data, merge_stats = self.yaml_store.merge_increment(current_output, parsed_yaml, schema_definition)
                 self.yaml_store.write_yaml(task.output_path, merged_data)
+                self._log(
+                    task,
+                    f"merge completed replaced={merge_stats.replaced_nodes} appended={merge_stats.appended_nodes}",
+                )
                 progress = self.progress_store.update_validation(progress, result="passed", error_count=0, last_error="")
                 progress = self.progress_store.update_merge(progress, merge_stats)
                 progress = self.progress_store.mark_chapter_completed(
@@ -179,25 +229,34 @@ class TaskRunner:
                 self.progress_store.save(task.progress_path, progress)
                 self._emit_progress(task, schema_definition, progress, template.name)
                 self.workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
+                self._log(task, f"chapter completed chapter={chapter.chapter_index}/{total_chapters}")
                 return {"progress": progress}
 
             chapter_retry += 1
             if chapter_retry < self.config.retry_count and self.config.retry_backoff_seconds > 0:
+                self._log(task, f"chapter retry sleeping seconds={self.config.retry_backoff_seconds}")
                 time.sleep(self.config.retry_backoff_seconds)
 
         progress = self.progress_store.mark_failed(progress, last_error=last_error or "chapter retries exhausted", retry_attempt=chapter_retry)
         self.progress_store.save(task.progress_path, progress)
+        self._log(task, f"chapter failed last_error={self._last_error(progress)}")
         self._emit_progress(task, schema_definition, progress, "failed")
         return {"progress": progress}
 
-    def _collect_stream(self, stream_buffer_path: Path, prompt: str) -> tuple[str, int]:
+    def _collect_stream(self, stream_buffer_path: Path, response_debug_path: Path, prompt: str) -> tuple[str, int]:
         chunks: list[str] = []
         chunk_count = 0
         stream_buffer_path.parent.mkdir(parents=True, exist_ok=True)
-        with stream_buffer_path.open("w", encoding="utf-8") as handle:
+        response_debug_path.parent.mkdir(parents=True, exist_ok=True)
+        with (
+            stream_buffer_path.open("w", encoding="utf-8") as stream_handle,
+            response_debug_path.open("w", encoding="utf-8") as debug_handle,
+        ):
             for chunk in self.model_client.stream_yaml(prompt):
-                handle.write(chunk)
-                handle.flush()
+                stream_handle.write(chunk)
+                stream_handle.flush()
+                debug_handle.write(chunk)
+                debug_handle.flush()
                 chunks.append(chunk)
                 chunk_count += 1
         return "".join(chunks), chunk_count
@@ -239,9 +298,32 @@ class TaskRunner:
         status = progress.get("status", "unknown")
         current = progress.get("last_completed_chapter_index", 0)
         total = progress.get("total_chapters", 0)
+        last_error = self._last_error(progress)
+        suffix = f" last_error={last_error}" if last_error else ""
         print(
             f"[{task.workspace.epub_name}][{schema_definition.schema_name}] "
             f"{current}/{total} template={template_name} status={status} "
             f"retries={retry.get('current_attempt', 0)} "
-            f"replaced={merge.get('replaced_nodes', 0)} appended={merge.get('appended_nodes', 0)}"
+            f"replaced={merge.get('replaced_nodes', 0)} appended={merge.get('appended_nodes', 0)}{suffix}"
         )
+
+    def _log(self, task: TaskDefinition, message: str) -> None:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_line = f"[{timestamp}] [{task.workspace.epub_name}][{task.schema_path.stem}] {message}"
+        print(log_line)
+        log_path = task.workspace.log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
+            handle.write(log_line + "\n")
+
+    def _write_text(self, path: Path, content: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+
+    def _last_error(self, progress: dict[str, Any]) -> str:
+        retry = progress.get("retry", {})
+        last_error = retry.get("last_error", "")
+        if isinstance(last_error, str):
+            return last_error.strip()
+        return str(last_error)
