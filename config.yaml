@@ -1,0 +1,25 @@
+input_epubs: []
+schema_paths:
+  - schemas/characters.yaml
+  - schemas/world.yaml
+prompt_templates:
+  - prompts/base.md
+  - prompts/retry_format.md
+  - prompts/retry_schema.md
+workspace_root: workspace
+concurrency:
+  enable_parallel_tasks: true
+  task_unit: epub_schema
+  max_workers: 4
+model:
+  provider: openai
+  name: gpt-4.1
+  streaming: true
+  base_url: https://api.openai.com/v1
+  api_key: <KEY>
+runtime:
+  resume: true
+  retry_count: 3
+  retry_backoff_seconds: 3
+progress:
+  emit_console_progress: true
