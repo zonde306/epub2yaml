@@ -27,7 +27,7 @@ class YamlStore:
     def initialize_output(self, path: Path, schema_definition: SchemaDefinition) -> None:
         if path.exists():
             return
-        initial = {schema_definition.root_key: []}
+        initial = {schema_definition.root_key: {}}
         self.write_yaml(path, initial)
 
     def write_yaml(self, path: Path, data: dict[str, Any]) -> None:
@@ -47,30 +47,19 @@ class YamlStore:
         schema_definition: SchemaDefinition,
     ) -> tuple[dict[str, Any], MergeStats]:
         root_key = schema_definition.root_key
-        match_key = schema_definition.match_key
-        existing_items = list(current_data.get(root_key, []) or [])
-        incoming_items = list(increment_data.get(root_key, []) or [])
+        existing_items = dict(current_data.get(root_key, {}) or {})
+        incoming_items = dict(increment_data.get(root_key, {}) or {})
         stats = MergeStats()
 
-        index_by_key: dict[str, int] = {}
-        for index, item in enumerate(existing_items):
-            if isinstance(item, dict) and match_key in item:
-                index_by_key[str(item[match_key])] = index
-
-        for item in incoming_items:
-            if not isinstance(item, dict):
+        for item_key, item_value in incoming_items.items():
+            if not isinstance(item_value, dict):
                 raise ValueError("increment item must be mapping")
-            if match_key not in item:
-                raise ValueError(f"increment item missing match key: {match_key}")
 
-            item_key = str(item[match_key])
-            if item_key in index_by_key:
-                existing_index = index_by_key[item_key]
-                existing_items[existing_index] = self._merge_node(existing_items[existing_index], item)
+            if item_key in existing_items:
+                existing_items[item_key] = self._merge_node(existing_items[item_key], item_value)
                 stats.replaced_nodes += 1
             else:
-                index_by_key[item_key] = len(existing_items)
-                existing_items.append(self._clone_node(item))
+                existing_items[item_key] = self._clone_node(item_value)
                 stats.appended_nodes += 1
 
         merged = dict(current_data)
@@ -106,3 +95,5 @@ class YamlStore:
         if isinstance(node, list):
             return [self._clone_node(item) for item in node]
         return node
+
+

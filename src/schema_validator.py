@@ -48,11 +48,14 @@ class SchemaValidator:
 
         if isinstance(node, dict):
             sanitized_mapping: dict[str, Any] = {}
-            for key, value in node.items():
+            for raw_key, value in node.items():
+                sanitized_key = self._sanitize_key(raw_key)
+                if sanitized_key is _REMOVE:
+                    continue
                 sanitized_value = self.sanitize_node(value)
                 if sanitized_value is _REMOVE:
                     continue
-                sanitized_mapping[key] = sanitized_value
+                sanitized_mapping[sanitized_key] = sanitized_value
             return sanitized_mapping if sanitized_mapping else _REMOVE
 
         return node
@@ -60,7 +63,6 @@ class SchemaValidator:
     def validate_increment(self, data: dict[str, Any], schema_definition: SchemaDefinition) -> ValidationResult:
         errors: list[ValidationIssue] = []
         root_key = schema_definition.root_key
-        match_key = schema_definition.match_key
 
         extra_top_level_keys = [key for key in data.keys() if key not in schema_definition.allowed_top_level_keys]
         for key in extra_top_level_keys:
@@ -70,22 +72,22 @@ class SchemaValidator:
             return ValidationResult(ok=not errors, errors=errors)
 
         root_value = data[root_key]
-        if not isinstance(root_value, list):
-            errors.append(ValidationIssue(path=root_key, reason="root value must be a list"))
+        if not isinstance(root_value, dict):
+            errors.append(ValidationIssue(path=root_key, reason="root value must be a mapping"))
             return ValidationResult(ok=False, errors=errors)
 
         if not root_value:
             return ValidationResult(ok=not errors, errors=errors)
 
         item_skeleton = self._extract_item_skeleton(schema_definition)
-        for index, item in enumerate(root_value):
-            item_path = f"{root_key}[{index}]"
-            if not isinstance(item, dict):
-                errors.append(ValidationIssue(path=item_path, reason="list item must be mapping"))
+        for item_key, item in root_value.items():
+            item_path = f"{root_key}.{item_key}"
+            if self._is_missing_entry_key(item_key):
+                errors.append(ValidationIssue(path=item_path, reason="required match key is missing"))
                 continue
-
-            if match_key not in item or self._is_missing_match_value(item[match_key]):
-                errors.append(ValidationIssue(path=f"{item_path}.{match_key}", reason="required match key is missing"))
+            if not isinstance(item, dict):
+                errors.append(ValidationIssue(path=item_path, reason="root entry must be mapping"))
+                continue
 
             self._validate_against_skeleton(
                 node=item,
@@ -98,18 +100,12 @@ class SchemaValidator:
 
     def _extract_item_skeleton(self, schema_definition: SchemaDefinition) -> Any:
         root_value = schema_definition.raw_schema[schema_definition.root_key]
-        skeleton: Any = {}
         if isinstance(root_value, dict):
             first_value = next(iter(root_value.values()), {})
-            skeleton = first_value if isinstance(first_value, dict) else {}
-        elif isinstance(root_value, list) and root_value:
-            skeleton = root_value[0]
-
-        if isinstance(skeleton, dict) and schema_definition.match_key and schema_definition.match_key not in skeleton:
-            enriched = dict(skeleton)
-            enriched[schema_definition.match_key] = ""
-            return enriched
-        return skeleton
+            return first_value if isinstance(first_value, dict) else {}
+        if isinstance(root_value, list) and root_value:
+            return root_value[0]
+        return {}
 
     def _validate_against_skeleton(
         self,
@@ -152,7 +148,13 @@ class SchemaValidator:
         elif expected_type == "boolean" and not isinstance(node, bool):
             errors.append(ValidationIssue(path=path, reason=f"expected boolean but got {type(node).__name__}"))
 
-    def _is_missing_match_value(self, value: Any) -> bool:
+    def _sanitize_key(self, key: Any) -> Any:
+        if isinstance(key, str):
+            normalized = key.strip()
+            return normalized if normalized else _REMOVE
+        return key
+
+    def _is_missing_entry_key(self, value: Any) -> bool:
         if value is None:
             return True
         if isinstance(value, str):

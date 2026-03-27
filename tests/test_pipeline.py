@@ -31,6 +31,9 @@ class WorkspaceManagerTests(unittest.TestCase):
     def test_slugify_epub_name_normalizes_symbols(self) -> None:
         self.assertEqual(slugify_epub_name(" My Novel 01! "), "my-novel-01")
 
+    def test_slugify_epub_name_keeps_unicode_file_name_instead_of_falling_back_to_epub(self) -> None:
+        self.assertEqual(slugify_epub_name("给了失去一切卖身的少女一切的结果"), "给了失去一切卖身的少女一切的结果")
+
     def test_ensure_workspace_creates_expected_directories(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -41,6 +44,8 @@ class WorkspaceManagerTests(unittest.TestCase):
             manager = WorkspaceManager(workspace_root)
             workspace = manager.ensure_workspace(input_epub)
 
+            self.assertEqual(workspace.epub_name, "示例-小说")
+            self.assertEqual(workspace.root, workspace_root / "示例-小说")
             self.assertTrue(workspace.root.exists())
             self.assertTrue(workspace.source_dir.exists())
             self.assertTrue(workspace.output_dir.exists())
@@ -91,6 +96,7 @@ class SchemaLoaderTests(unittest.TestCase):
         field_paths = {field.path for field in schema.fields}
         self.assertIn("actors[].name", field_paths)
         self.assertIn("actors[].trigger_keywords", field_paths)
+        self.assertIsInstance(schema.raw_schema["actors"], dict)
 
 
 class SchemaValidatorTests(unittest.TestCase):
@@ -107,9 +113,8 @@ class SchemaValidatorTests(unittest.TestCase):
 
     def test_sanitize_increment_data_removes_empty_values_and_trims_strings(self) -> None:
         payload = {
-            "worldinfo": [
-                {
-                    "name": "  黑风寨  ",
+            "worldinfo": {
+                "  黑风寨  ": {
                     "trigger_keywords": [" 黑风寨 ", "   ", None],
                     "content": "   ",
                     "metadata": {},
@@ -121,11 +126,10 @@ class SchemaValidatorTests(unittest.TestCase):
                         "empty_list": [],
                     },
                 },
-                {
-                    "name": "   ",
+                "   ": {
                     "content": None,
                 },
-            ],
+            },
             "other": {},
         }
 
@@ -134,34 +138,32 @@ class SchemaValidatorTests(unittest.TestCase):
         self.assertEqual(
             sanitized,
             {
-                "worldinfo": [
-                    {
-                        "name": "黑风寨",
+                "worldinfo": {
+                    "黑风寨": {
                         "trigger_keywords": ["黑风寨"],
                         "enabled": False,
                         "priority": 0,
                         "notes": {"summary": "山寨势力"},
                     }
-                ]
+                }
             },
         )
 
-    def test_validate_increment_accepts_empty_list(self) -> None:
+    def test_validate_increment_accepts_empty_mapping(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
 
-        result = self.validator.validate_increment({"worldinfo": []}, schema)
+        result = self.validator.validate_increment({"worldinfo": {}}, schema)
 
         self.assertTrue(result.ok)
 
     def test_validate_increment_accepts_partial_update_after_sanitize(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
         payload = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "content": "位于山谷中的势力。",
                 }
-            ]
+            }
         }
 
         sanitized = self.validator.sanitize_increment_data(payload)
@@ -172,22 +174,21 @@ class SchemaValidatorTests(unittest.TestCase):
     def test_validate_increment_rejects_missing_match_key(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
         payload = {
-            "worldinfo": [
-                {
-                    "trigger_keywords": ["黑风寨"],
+            "worldinfo": {
+                "   ": {
                     "content": "位于山谷中的势力。",
                 }
-            ]
+            }
         }
 
         result = self.validator.validate_increment(payload, schema)
 
         self.assertFalse(result.ok)
-        self.assertTrue(any(error.path.endswith(".name") for error in result.errors))
+        self.assertTrue(any(error.path == "worldinfo.   " for error in result.errors))
 
     def test_validate_increment_rejects_unexpected_top_level_key(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
-        payload = {"actors": []}
+        payload = {"actors": {}}
 
         result = self.validator.validate_increment(payload, schema)
 
@@ -197,12 +198,11 @@ class SchemaValidatorTests(unittest.TestCase):
     def test_validate_increment_rejects_unexpected_field(self) -> None:
         schema = self.loader.load(Path("schemas/world.yaml"))
         payload = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "unknown": "x",
                 }
-            ]
+            }
         }
 
         result = self.validator.validate_increment(payload, schema)
@@ -242,7 +242,7 @@ class PromptBuilderTests(unittest.TestCase):
         self.assertIn("root=worldinfo", prompt)
         self.assertIn("error=schema validation failed", prompt)
         self.assertIn("顶层只能包含 `worldinfo`", prompt)
-        self.assertIn("允许只返回新增或更新过的字段", prompt)
+        self.assertIn("其值必须是对象映射，而不是列表", prompt)
 
 
 class YamlStoreTests(unittest.TestCase):
@@ -252,28 +252,25 @@ class YamlStoreTests(unittest.TestCase):
 
     def test_merge_increment_merges_and_appends_nodes(self) -> None:
         current = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "trigger_keywords": ["旧关键字"],
                     "content": "旧内容",
                     "type": "势力",
                 }
-            ]
+            }
         }
         increment = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "trigger_keywords": ["黑风寨"],
                     "content": "新内容",
                 },
-                {
-                    "name": "青石镇",
+                "青石镇": {
                     "trigger_keywords": ["青石镇"],
                     "content": "新地点",
                 },
-            ]
+            }
         }
 
         merged, stats = self.store.merge_increment(current, increment, self.schema)
@@ -281,39 +278,37 @@ class YamlStoreTests(unittest.TestCase):
         self.assertEqual(stats.replaced_nodes, 1)
         self.assertEqual(stats.appended_nodes, 1)
         self.assertEqual(len(merged["worldinfo"]), 2)
-        self.assertEqual(merged["worldinfo"][0]["content"], "新内容")
-        self.assertEqual(merged["worldinfo"][0]["type"], "势力")
-        self.assertEqual(merged["worldinfo"][1]["name"], "青石镇")
+        self.assertEqual(merged["worldinfo"]["黑风寨"]["content"], "新内容")
+        self.assertEqual(merged["worldinfo"]["黑风寨"]["type"], "势力")
+        self.assertEqual(merged["worldinfo"]["青石镇"]["content"], "新地点")
 
     def test_merge_increment_recursively_merges_nested_dicts(self) -> None:
         current = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "details": {
                         "summary": "旧摘要",
                         "extra": {"region": "北境", "climate": "寒冷"},
                     },
                 }
-            ]
+            }
         }
         increment = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "details": {
                         "summary": "新摘要",
                         "extra": {"region": "西境"},
                     },
                 }
-            ]
+            }
         }
 
         merged, stats = self.store.merge_increment(current, increment, self.schema)
 
         self.assertEqual(stats.replaced_nodes, 1)
         self.assertEqual(
-            merged["worldinfo"][0]["details"],
+            merged["worldinfo"]["黑风寨"]["details"],
             {
                 "summary": "新摘要",
                 "extra": {"region": "西境", "climate": "寒冷"},
@@ -322,32 +317,30 @@ class YamlStoreTests(unittest.TestCase):
 
     def test_merge_increment_replaces_lists_as_a_whole(self) -> None:
         current = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "trigger_keywords": ["旧关键字", "别名"],
                 }
-            ]
+            }
         }
         increment = {
-            "worldinfo": [
-                {
-                    "name": "黑风寨",
+            "worldinfo": {
+                "黑风寨": {
                     "trigger_keywords": ["新关键字"],
                 }
-            ]
+            }
         }
 
         merged, stats = self.store.merge_increment(current, increment, self.schema)
 
         self.assertEqual(stats.replaced_nodes, 1)
-        self.assertEqual(merged["worldinfo"][0]["trigger_keywords"], ["新关键字"])
+        self.assertEqual(merged["worldinfo"]["黑风寨"]["trigger_keywords"], ["新关键字"])
 
-    def test_merge_increment_requires_match_key(self) -> None:
+    def test_merge_increment_requires_mapping_value(self) -> None:
         with self.assertRaises(ValueError):
             self.store.merge_increment(
-                {"worldinfo": []},
-                {"worldinfo": [{"content": "缺少 name"}]},
+                {"worldinfo": {}},
+                {"worldinfo": {"黑风寨": "错误值"}},
                 self.schema,
             )
 
@@ -358,7 +351,8 @@ class TaskRunnerTests(unittest.TestCase):
             def stream_yaml(self, prompt: str):
                 self.last_prompt = prompt
                 yield "worldinfo:\n"
-                yield "- name: 黑风寨\n"
+                yield "  黑风寨:\n"
+                yield "    content: 新内容\n"
 
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -378,8 +372,8 @@ class TaskRunnerTests(unittest.TestCase):
             yaml_text, chunk_count = runner._collect_stream(stream_buffer_path, response_debug_path, "hello prompt")
 
             self.assertEqual(client.last_prompt, "hello prompt")
-            self.assertEqual(chunk_count, 2)
-            self.assertEqual(yaml_text, "worldinfo:\n- name: 黑风寨\n")
+            self.assertEqual(chunk_count, 3)
+            self.assertEqual(yaml_text, "worldinfo:\n  黑风寨:\n    content: 新内容\n")
             self.assertEqual(stream_buffer_path.read_text(encoding="utf-8"), yaml_text)
             self.assertEqual(response_debug_path.read_text(encoding="utf-8"), yaml_text)
 

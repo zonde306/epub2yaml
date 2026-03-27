@@ -140,7 +140,8 @@ def extract_fields_from_text(schema_text: str, root_key: str) -> list[SchemaFiel
 
 
 def build_raw_schema_from_fields(root_key: str, fields: list[SchemaField]) -> dict[str, Any]:
-    root: dict[str, Any] = {root_key: [{}]}
+    match_key = ROOT_KEY_MATCH_KEY_MAP.get(root_key, DEFAULT_MATCH_KEY)
+    root: dict[str, Any] = {root_key: {f"<{match_key}>": {}}}
     all_paths = [field.path for field in fields]
 
     for field in sorted(fields, key=lambda item: (item.path.count("."), item.path)):
@@ -152,7 +153,7 @@ def build_raw_schema_from_fields(root_key: str, fields: list[SchemaField]) -> di
             continue
 
         parts = [part for part in suffix.split(".") if part]
-        current: dict[str, Any] = root[root_key][0]
+        current: dict[str, Any] = root[root_key][f"<{match_key}>"]
         full_path_parts: list[str] = []
 
         for part_index, part in enumerate(parts):
@@ -189,6 +190,7 @@ def build_raw_schema_from_fields(root_key: str, fields: list[SchemaField]) -> di
                 current = current[key]
 
     return root
+
 
 
 def default_value_for_path(field_path: str, field_type: str, all_paths: list[str]) -> Any:

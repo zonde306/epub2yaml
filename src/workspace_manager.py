@@ -6,7 +6,7 @@ from pathlib import Path
 
 from models import WorkspacePaths
 
-INVALID_WORKSPACE_CHARS = re.compile(r"[^a-zA-Z0-9._-]+")
+INVALID_WORKSPACE_CHARS = re.compile(r"[^\w.-]+", re.UNICODE)
 
 
 class WorkspaceManager:
@@ -52,3 +52,4 @@ def slugify_epub_name(name: str) -> str:
     normalized = INVALID_WORKSPACE_CHARS.sub("-", stripped)
     normalized = normalized.strip("-._")
     return normalized or "epub"
+

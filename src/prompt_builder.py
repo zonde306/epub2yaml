@@ -34,8 +34,9 @@ class PromptBuilder:
 def build_output_rules(schema_definition: SchemaDefinition) -> str:
     lines = [
         f"- 顶层只能包含 `{schema_definition.root_key}`",
-        f"- 若输出了 `{schema_definition.root_key}`，其值必须是列表",
-        f"- 列表中的每个节点都必须包含非空 `{schema_definition.match_key}`",
+        f"- 若输出了 `{schema_definition.root_key}`，其值必须是对象映射，而不是列表",
+        f"- `{schema_definition.root_key}` 下的每个 key 都必须是非空 `{schema_definition.match_key}`",
+        "- 每个条目的 key 就是唯一标识，不要在条目内部重复输出同名 match_key 字段",
         "- 允许只返回新增或更新过的字段，不需要返回完整节点",
         "- 不要输出空字符串、仅空白字符串、空列表、空字典或 `~`",
         "- 若无法确认字段值，直接省略该字段，不要输出无意义占位值",

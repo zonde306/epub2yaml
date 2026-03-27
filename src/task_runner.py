@@ -140,7 +140,7 @@ class TaskRunner:
                 )
                 self.progress_store.save(task.progress_path, progress)
 
-                current_output = self.yaml_store.load_yaml(task.output_path, default={schema_definition.root_key: []})
+                current_output = self.yaml_store.load_yaml(task.output_path, default={schema_definition.root_key: {}})
                 prompt = self.prompt_builder.build(
                     template,
                     chapter=chapter,
@@ -282,7 +282,7 @@ class TaskRunner:
         world_path = task.workspace.output_dir / "world.yaml"
         if not world_path.exists():
             return "{}"
-        world_data = self.yaml_store.load_yaml(world_path, default={"worldinfo": []})
+        world_data = self.yaml_store.load_yaml(world_path, default={"worldinfo": {}})
         return self.yaml_store.dump_to_string(world_data)
 
     def _emit_progress(
