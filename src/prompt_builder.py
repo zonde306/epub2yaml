@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from models import Chapter, PromptTemplate, SchemaDefinition
+from models import ChapterBatch, PromptTemplate, SchemaDefinition
 
 
 class PromptBuilder:
@@ -10,14 +10,14 @@ class PromptBuilder:
         self,
         template: PromptTemplate,
         *,
-        chapter: Chapter,
+        batch: ChapterBatch,
         schema_definition: SchemaDefinition,
         existing_yaml: str,
         existing_worldinfo: str,
         error_summary: str,
     ) -> str:
         values: dict[str, Any] = {
-            "source_text": chapter.text,
+            "source_text": build_batch_source_text(batch),
             "schema_text": schema_definition.schema_text,
             "existing_yaml": existing_yaml.strip() or "{}",
             "existing_worldinfo": existing_worldinfo.strip() or "{}",
@@ -25,10 +25,38 @@ class PromptBuilder:
             "root_key": schema_definition.root_key,
             "match_key": schema_definition.match_key,
             "output_rules": build_output_rules(schema_definition),
-            "chapter_title": chapter.title,
-            "chapter_id": chapter.chapter_id,
+            "chapter_title": describe_batch_titles(batch),
+            "chapter_id": batch.display_range,
+            "batch_id": batch.batch_id,
+            "batch_range": batch.display_range,
+            "chapter_count": batch.chapter_count,
         }
         return render_template(template.content, values)
+
+
+def build_batch_source_text(batch: ChapterBatch) -> str:
+    sections: list[str] = []
+    for chapter in batch.chapters:
+        sections.append(
+            "\n".join(
+                [
+                    f"### Chapter {chapter.chapter_index}",
+                    f"chapter_id: {chapter.chapter_id}",
+                    f"chapter_title: {chapter.title}",
+                    "",
+                    chapter.text.strip(),
+                ]
+            ).strip()
+        )
+    return "\n\n".join(section for section in sections if section).strip()
+
+
+def describe_batch_titles(batch: ChapterBatch) -> str:
+    if batch.chapter_count == 1:
+        return batch.chapters[0].title
+    first = batch.chapters[0]
+    last = batch.chapters[-1]
+    return f"{first.title} ~ {last.title}"
 
 
 def build_output_rules(schema_definition: SchemaDefinition) -> str:

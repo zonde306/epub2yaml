@@ -7,7 +7,7 @@ from typing import Any
 
 from epub_reader import extract_epub
 from llm_client import build_model_client
-from models import AppConfig, Chapter, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition
+from models import AppConfig, Chapter, ChapterBatch, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition
 from progress_store import ProgressStore
 from prompt_builder import PromptBuilder
 from prompt_loader import PromptLoader
@@ -78,64 +78,168 @@ class TaskRunner:
             self._log(task, f"removed stale stream buffer path={task.stream_buffer_path}")
 
         start_index = int(progress.get("last_completed_chapter_index", 0))
-        existing_worldinfo = self._load_existing_worldinfo(task)
+        remaining_chapters = chapters[start_index:]
+        batches = self._build_initial_batches(task, remaining_chapters)
 
-        for chapter in chapters[start_index:]:
+        for batch in batches:
             self._log(
                 task,
-                f"chapter start chapter={chapter.chapter_index}/{len(chapters)} chapter_id={chapter.chapter_id} title={chapter.title}",
+                f"batch start range={batch.display_range} depth={batch.split_depth} count={batch.chapter_count} tokens={batch.token_estimate}",
             )
-            chapter_result = self._run_chapter(
+            batch_result = self._run_batch_tree(
                 task,
-                chapter=chapter,
+                batch=batch,
                 total_chapters=len(chapters),
                 schema_definition=schema_definition,
                 prompt_templates=prompt_templates,
                 progress=progress,
-                existing_worldinfo=existing_worldinfo,
             )
-            progress = chapter_result["progress"]
+            progress = batch_result["progress"]
             if progress.get("status") == "failed":
                 self._log(task, f"task failed last_error={self._last_error(progress)}")
                 return progress
 
         if progress.get("status") != "failed":
             progress["status"] = "completed"
+            progress["batch_status"] = "completed"
             self.progress_store.save(task.progress_path, progress)
             self._log(task, "task completed")
         return progress
 
-    def _run_chapter(
+    def _build_initial_batches(self, task: TaskDefinition, chapters: list[Chapter]) -> list[ChapterBatch]:
+        if not chapters:
+            return []
+
+        if not self.config.batching.enable_multi_chapter:
+            return [ChapterBatch.from_chapters([chapter]) for chapter in chapters]
+
+        budget = self.config.batching.chapter_token_budget
+        if budget <= 0:
+            self._log(task, "batching disabled by zero chapter token budget, fallback to single chapter batches")
+            return [ChapterBatch.from_chapters([chapter]) for chapter in chapters]
+
+        batches: list[ChapterBatch] = []
+        pending: list[Chapter] = []
+        pending_tokens = 0
+
+        for chapter in chapters:
+            if chapter.token_estimate > budget:
+                if not self.config.batching.allow_oversize_single_chapter:
+                    raise ValueError(
+                        f"chapter {chapter.chapter_id} token estimate {chapter.token_estimate} exceeds budget {budget}"
+                    )
+                if pending:
+                    batches.append(ChapterBatch.from_chapters(pending))
+                    pending = []
+                    pending_tokens = 0
+                oversize_batch = ChapterBatch.from_chapters([chapter])
+                batches.append(oversize_batch)
+                self._log(
+                    task,
+                    f"oversize single chapter batch allowed range={oversize_batch.display_range} chapter_id={chapter.chapter_id} tokens={chapter.token_estimate} budget={budget}",
+                )
+                continue
+
+            projected_tokens = pending_tokens + chapter.token_estimate
+            if pending and projected_tokens > budget:
+                batches.append(ChapterBatch.from_chapters(pending))
+                pending = [chapter]
+                pending_tokens = chapter.token_estimate
+                continue
+
+            pending.append(chapter)
+            pending_tokens = projected_tokens
+
+        if pending:
+            batches.append(ChapterBatch.from_chapters(pending))
+
+        return batches
+
+    def _run_batch_tree(
         self,
         task: TaskDefinition,
         *,
-        chapter: Chapter,
+        batch: ChapterBatch,
         total_chapters: int,
         schema_definition: SchemaDefinition,
         prompt_templates: list[PromptTemplate],
         progress: dict[str, Any],
-        existing_worldinfo: str,
     ) -> dict[str, Any]:
-        chapter_retry = 0
+        batch_result = self._run_batch(
+            task,
+            batch=batch,
+            total_chapters=total_chapters,
+            schema_definition=schema_definition,
+            prompt_templates=prompt_templates,
+            progress=progress,
+        )
+        progress = batch_result["progress"]
+        if progress.get("status") != "failed":
+            return {"progress": progress}
+
+        if not self._should_split_batch(batch):
+            return {"progress": progress}
+
+        split_reason = self._last_error(progress) or "batch retries exhausted"
+        progress = self.progress_store.mark_batch_split(progress, batch=batch, reason=split_reason)
+        self.progress_store.save(task.progress_path, progress)
+        left_batch, right_batch = batch.split()
+        self._log(
+            task,
+            f"batch split parent={batch.batch_id} range={batch.display_range} -> left={left_batch.display_range} right={right_batch.display_range} reason={split_reason}",
+        )
+
+        left_result = self._run_batch_tree(
+            task,
+            batch=left_batch,
+            total_chapters=total_chapters,
+            schema_definition=schema_definition,
+            prompt_templates=prompt_templates,
+            progress=progress,
+        )
+        progress = left_result["progress"]
+        if progress.get("status") == "failed":
+            return {"progress": progress}
+
+        return self._run_batch_tree(
+            task,
+            batch=right_batch,
+            total_chapters=total_chapters,
+            schema_definition=schema_definition,
+            prompt_templates=prompt_templates,
+            progress=progress,
+        )
+
+    def _run_batch(
+        self,
+        task: TaskDefinition,
+        *,
+        batch: ChapterBatch,
+        total_chapters: int,
+        schema_definition: SchemaDefinition,
+        prompt_templates: list[PromptTemplate],
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        batch_retry = 0
         last_error = ""
 
-        while chapter_retry < self.config.retry_count:
+        while batch_retry < self.config.retry_count:
             attempted_templates: list[str] = []
             for template in prompt_templates:
                 attempted_templates.append(str(template.path).replace("\\", "/"))
                 self._log(
                     task,
-                    f"chapter attempt chapter={chapter.chapter_index}/{total_chapters} retry={chapter_retry + 1}/{self.config.retry_count} template={template.name}",
+                    f"batch attempt range={batch.display_range} depth={batch.split_depth} retry={batch_retry + 1}/{self.config.retry_count} template={template.name}",
                 )
                 progress = self.progress_store.update_running(
                     progress,
-                    chapter_index=chapter.chapter_index,
+                    batch=batch,
                     completed_chapters=int(progress.get("completed_chapters", 0)),
                     total_chapters=total_chapters,
                     template=template,
                     attempted_templates=attempted_templates,
-                    retry_attempt=chapter_retry,
-                    status="running" if chapter_retry == 0 else "retrying",
+                    retry_attempt=batch_retry,
+                    status="running" if batch_retry == 0 else "retrying",
                     last_error=last_error,
                 )
                 self.progress_store.save(task.progress_path, progress)
@@ -143,22 +247,26 @@ class TaskRunner:
                 current_output = self.yaml_store.load_yaml(task.output_path, default={schema_definition.root_key: {}})
                 prompt = self.prompt_builder.build(
                     template,
-                    chapter=chapter,
+                    batch=batch,
                     schema_definition=schema_definition,
                     existing_yaml=self.yaml_store.dump_to_string(current_output),
-                    existing_worldinfo=existing_worldinfo,
+                    existing_worldinfo=self._load_existing_worldinfo(task),
                     error_summary=last_error,
                 )
                 prompt_debug_path = task.workspace.prompt_debug_path_for_attempt(
                     schema_name=schema_definition.schema_name,
-                    chapter_index=chapter.chapter_index,
-                    retry_attempt=chapter_retry + 1,
+                    start_chapter_index=batch.start_chapter_index,
+                    end_chapter_index=batch.end_chapter_index,
+                    split_depth=batch.split_depth,
+                    retry_attempt=batch_retry + 1,
                     template_name=template.name,
                 )
                 response_debug_path = task.workspace.response_debug_path_for_attempt(
                     schema_name=schema_definition.schema_name,
-                    chapter_index=chapter.chapter_index,
-                    retry_attempt=chapter_retry + 1,
+                    start_chapter_index=batch.start_chapter_index,
+                    end_chapter_index=batch.end_chapter_index,
+                    split_depth=batch.split_depth,
+                    retry_attempt=batch_retry + 1,
                     template_name=template.name,
                 )
                 self._write_text(prompt_debug_path, prompt)
@@ -182,12 +290,12 @@ class TaskRunner:
                     self._emit_progress(task, schema_definition, progress, template.name)
                     continue
 
-                self._log(task, f"stream completed chunk_count={chunk_count}")
+                self._log(task, f"stream completed range={batch.display_range} chunk_count={chunk_count}")
                 progress = self.progress_store.update_stream(progress, receive_status="completed", chunk_count=chunk_count)
                 parsed_yaml, parse_result = self.schema_validator.parse_yaml_text(yaml_text)
                 if not parse_result.ok or parsed_yaml is None:
                     last_error = parse_result.summary()
-                    self._log(task, f"yaml parse failed error={last_error}")
+                    self._log(task, f"yaml parse failed range={batch.display_range} error={last_error}")
                     progress = self.progress_store.update_validation(
                         progress,
                         result="failed",
@@ -202,7 +310,7 @@ class TaskRunner:
                 validation_result = self.schema_validator.validate_increment(sanitized_yaml, schema_definition)
                 if not validation_result.ok:
                     last_error = validation_result.summary()
-                    self._log(task, f"schema validation failed error={last_error}")
+                    self._log(task, f"schema validation failed range={batch.display_range} error={last_error}")
                     progress = self.progress_store.update_validation(
                         progress,
                         result="failed",
@@ -217,32 +325,50 @@ class TaskRunner:
                 self.yaml_store.write_yaml(task.output_path, merged_data)
                 self._log(
                     task,
-                    f"merge completed replaced={merge_stats.replaced_nodes} appended={merge_stats.appended_nodes}",
+                    f"merge completed range={batch.display_range} replaced={merge_stats.replaced_nodes} appended={merge_stats.appended_nodes}",
                 )
                 progress = self.progress_store.update_validation(progress, result="passed", error_count=0, last_error="")
                 progress = self.progress_store.update_merge(progress, merge_stats)
-                progress = self.progress_store.mark_chapter_completed(
+                progress = self.progress_store.mark_batch_completed(
                     progress,
-                    chapter_index=chapter.chapter_index,
-                    chapter_id=chapter.chapter_id,
+                    batch=batch,
                     total_chapters=total_chapters,
                 )
                 self.progress_store.save(task.progress_path, progress)
                 self._emit_progress(task, schema_definition, progress, template.name)
                 self.workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
-                self._log(task, f"chapter completed chapter={chapter.chapter_index}/{total_chapters}")
+                self._log(
+                    task,
+                    f"batch completed range={batch.display_range} depth={batch.split_depth} end_chapter={batch.end_chapter_index}/{total_chapters}",
+                )
                 return {"progress": progress}
 
-            chapter_retry += 1
-            if chapter_retry < self.config.retry_count and self.config.retry_backoff_seconds > 0:
-                self._log(task, f"chapter retry sleeping seconds={self.config.retry_backoff_seconds}")
+            batch_retry += 1
+            if batch_retry < self.config.retry_count and self.config.retry_backoff_seconds > 0:
+                self._log(task, f"batch retry sleeping seconds={self.config.retry_backoff_seconds}")
                 time.sleep(self.config.retry_backoff_seconds)
 
-        progress = self.progress_store.mark_failed(progress, last_error=last_error or "chapter retries exhausted", retry_attempt=chapter_retry)
+        progress = self.progress_store.mark_failed(
+            progress,
+            last_error=last_error or "batch retries exhausted",
+            retry_attempt=batch_retry,
+            batch=batch,
+        )
         self.progress_store.save(task.progress_path, progress)
-        self._log(task, f"chapter failed last_error={self._last_error(progress)}")
+        self._log(task, f"batch failed range={batch.display_range} last_error={self._last_error(progress)}")
         self._emit_progress(task, schema_definition, progress, "failed")
         return {"progress": progress}
+
+    def _should_split_batch(self, batch: ChapterBatch) -> bool:
+        if batch.chapter_count <= 1:
+            return False
+        if not self.config.batching.enable_multi_chapter:
+            return False
+        if not self.config.batching.split_on_failure:
+            return False
+        if not self.config.batching.split_after_retry_exhausted:
+            return False
+        return True
 
     def _collect_stream(self, stream_buffer_path: Path, response_debug_path: Path, prompt: str) -> tuple[str, int]:
         chunks: list[str] = []
@@ -299,12 +425,15 @@ class TaskRunner:
         status = progress.get("status", "unknown")
         current = progress.get("last_completed_chapter_index", 0)
         total = progress.get("total_chapters", 0)
+        batch_range = progress.get("current_batch_range", "")
+        batch_depth = progress.get("current_batch_depth", 0)
+        batch_status = progress.get("batch_status", "unknown")
         last_error = self._last_error(progress)
         suffix = f" last_error={last_error}" if last_error else ""
         print(
             f"[{task.workspace.epub_name}][{schema_definition.schema_name}] "
-            f"{current}/{total} template={template_name} status={status} "
-            f"retries={retry.get('current_attempt', 0)} "
+            f"{current}/{total} batch={batch_range} depth={batch_depth} template={template_name} "
+            f"status={status}/{batch_status} retries={retry.get('current_attempt', 0)} "
             f"replaced={merge.get('replaced_nodes', 0)} appended={merge.get('appended_nodes', 0)}{suffix}"
         )
 

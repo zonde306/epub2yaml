@@ -23,3 +23,11 @@ runtime:
   retry_backoff_seconds: 3
 progress:
   emit_console_progress: true
+batching:
+  enable_multi_chapter: true
+  max_input_tokens: 12000
+  prompt_overhead_tokens: 1500
+  reserve_output_tokens: 3000
+  allow_oversize_single_chapter: true
+  split_on_failure: true
+  split_after_retry_exhausted: true

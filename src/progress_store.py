@@ -6,7 +6,7 @@ from typing import Any
 
 import yaml
 
-from models import MergeStats, PromptTemplate
+from models import ChapterBatch, MergeStats, PromptTemplate
 
 
 class ProgressStore:
@@ -46,6 +46,13 @@ class ProgressStore:
             "completed_chapters": 0,
             "progress_percent": 0.0,
             "status": "pending",
+            "current_batch_id": "",
+            "current_batch_range": "",
+            "current_batch_depth": 0,
+            "current_batch_parent_id": "",
+            "batch_retry_count": 0,
+            "batch_status": "pending",
+            "last_split_reason": "",
             "prompt": {
                 "current_template": "",
                 "template_index": 0,
@@ -83,7 +90,7 @@ class ProgressStore:
         self,
         data: dict[str, Any],
         *,
-        chapter_index: int,
+        batch: ChapterBatch,
         completed_chapters: int,
         total_chapters: int,
         template: PromptTemplate,
@@ -92,7 +99,7 @@ class ProgressStore:
         status: str,
         last_error: str = "",
     ) -> dict[str, Any]:
-        data["current_chapter_index"] = chapter_index
+        data["current_chapter_index"] = batch.start_chapter_index
         data["completed_chapters"] = completed_chapters
         data["progress_percent"] = calculate_progress(completed_chapters, total_chapters)
         data["status"] = status
@@ -103,6 +110,9 @@ class ProgressStore:
         }
         data["retry"]["current_attempt"] = retry_attempt
         data["retry"]["last_error"] = last_error
+        self._set_batch_context(data, batch)
+        data["batch_retry_count"] = retry_attempt
+        data["batch_status"] = status
         return data
 
     def update_stream(self, data: dict[str, Any], *, receive_status: str, chunk_count: int) -> dict[str, Any]:
@@ -127,27 +137,52 @@ class ProgressStore:
         }
         return data
 
-    def mark_chapter_completed(
+    def mark_batch_completed(
         self,
         data: dict[str, Any],
         *,
-        chapter_index: int,
-        chapter_id: str,
+        batch: ChapterBatch,
         total_chapters: int,
     ) -> dict[str, Any]:
-        data["last_completed_chapter_index"] = chapter_index
-        data["last_completed_chapter_id"] = chapter_id
-        data["completed_chapters"] = chapter_index
-        data["current_chapter_index"] = min(chapter_index + 1, total_chapters)
-        data["progress_percent"] = calculate_progress(chapter_index, total_chapters)
-        data["status"] = "completed" if chapter_index >= total_chapters else "running"
+        self._set_batch_context(data, batch)
+        data["last_completed_chapter_index"] = batch.end_chapter_index
+        data["last_completed_chapter_id"] = batch.chapters[-1].chapter_id
+        data["completed_chapters"] = batch.end_chapter_index
+        data["current_chapter_index"] = min(batch.end_chapter_index + 1, total_chapters)
+        data["progress_percent"] = calculate_progress(batch.end_chapter_index, total_chapters)
+        data["status"] = "completed" if batch.end_chapter_index >= total_chapters else "running"
+        data["batch_status"] = "completed"
         return data
 
-    def mark_failed(self, data: dict[str, Any], *, last_error: str, retry_attempt: int) -> dict[str, Any]:
+    def mark_batch_split(self, data: dict[str, Any], *, batch: ChapterBatch, reason: str) -> dict[str, Any]:
+        self._set_batch_context(data, batch)
+        data["status"] = "splitting"
+        data["batch_status"] = "split"
+        data["last_split_reason"] = reason
+        return data
+
+    def mark_failed(
+        self,
+        data: dict[str, Any],
+        *,
+        last_error: str,
+        retry_attempt: int,
+        batch: ChapterBatch | None = None,
+    ) -> dict[str, Any]:
+        if batch is not None:
+            self._set_batch_context(data, batch)
+            data["batch_retry_count"] = retry_attempt
+            data["batch_status"] = "failed"
         data["status"] = "failed"
         data["retry"]["current_attempt"] = retry_attempt
         data["retry"]["last_error"] = last_error
         return data
+
+    def _set_batch_context(self, data: dict[str, Any], batch: ChapterBatch) -> None:
+        data["current_batch_id"] = batch.batch_id
+        data["current_batch_range"] = batch.display_range
+        data["current_batch_depth"] = batch.split_depth
+        data["current_batch_parent_id"] = batch.parent_batch_id
 
 
 def calculate_progress(completed: int, total: int) -> float:
@@ -158,3 +193,4 @@ def calculate_progress(completed: int, total: int) -> float:
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+

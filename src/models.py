@@ -18,6 +18,63 @@ class Chapter:
 
 
 @dataclass(slots=True)
+class ChapterBatch:
+    batch_id: str
+    parent_batch_id: str
+    split_depth: int
+    start_chapter_index: int
+    end_chapter_index: int
+    chapters: list[Chapter]
+    token_estimate: int
+    chapter_count: int
+
+    @classmethod
+    def from_chapters(
+        cls,
+        chapters: list[Chapter],
+        *,
+        split_depth: int = 0,
+        parent_batch_id: str = "",
+        batch_id: str = "",
+    ) -> ChapterBatch:
+        if not chapters:
+            raise ValueError("chapters must not be empty")
+        start_chapter_index = chapters[0].chapter_index
+        end_chapter_index = chapters[-1].chapter_index
+        resolved_batch_id = batch_id or build_batch_id(start_chapter_index, end_chapter_index, split_depth)
+        return cls(
+            batch_id=resolved_batch_id,
+            parent_batch_id=parent_batch_id,
+            split_depth=split_depth,
+            start_chapter_index=start_chapter_index,
+            end_chapter_index=end_chapter_index,
+            chapters=list(chapters),
+            token_estimate=sum(chapter.token_estimate for chapter in chapters),
+            chapter_count=len(chapters),
+        )
+
+    @property
+    def display_range(self) -> str:
+        return build_chapter_range_label(self.start_chapter_index, self.end_chapter_index)
+
+    def split(self) -> tuple[ChapterBatch, ChapterBatch]:
+        if self.chapter_count <= 1:
+            raise ValueError("single chapter batch cannot be split")
+        midpoint = self.chapter_count // 2
+        left = ChapterBatch.from_chapters(
+            self.chapters[:midpoint],
+            split_depth=self.split_depth + 1,
+            parent_batch_id=self.batch_id,
+        )
+        right = ChapterBatch.from_chapters(
+            self.chapters[midpoint:],
+            split_depth=self.split_depth + 1,
+            parent_batch_id=self.batch_id,
+        )
+        return left, right
+
+
+@dataclass(slots=True)
 class WorkspacePaths:
     epub_name: str
     root: Path
@@ -45,13 +102,17 @@ class WorkspacePaths:
     def prompt_debug_path_for_attempt(
         self,
         schema_name: str,
-        chapter_index: int,
+        start_chapter_index: int,
+        end_chapter_index: int,
+        split_depth: int,
         retry_attempt: int,
         template_name: str,
     ) -> Path:
         return self.debug_dir() / build_debug_artifact_name(
             schema_name=schema_name,
-            chapter_index=chapter_index,
+            start_chapter_index=start_chapter_index,
+            end_chapter_index=end_chapter_index,
+            split_depth=split_depth,
             retry_attempt=retry_attempt,
             template_name=template_name,
             suffix="prompt.txt",
@@ -60,13 +121,17 @@ class WorkspacePaths:
     def response_debug_path_for_attempt(
         self,
         schema_name: str,
-        chapter_index: int,
+        start_chapter_index: int,
+        end_chapter_index: int,
+        split_depth: int,
         retry_attempt: int,
         template_name: str,
     ) -> Path:
         return self.debug_dir() / build_debug_artifact_name(
             schema_name=schema_name,
-            chapter_index=chapter_index,
+            start_chapter_index=start_chapter_index,
+            end_chapter_index=end_chapter_index,
+            split_depth=split_depth,
             retry_attempt=retry_attempt,
             template_name=template_name,
             suffix="response.yaml",
@@ -76,14 +141,25 @@ class WorkspacePaths:
 def build_debug_artifact_name(
     *,
     schema_name: str,
-    chapter_index: int,
+    start_chapter_index: int,
+    end_chapter_index: int,
+    split_depth: int,
     retry_attempt: int,
     template_name: str,
     suffix: str,
 ) -> str:
     safe_schema = normalize_debug_token(schema_name)
     safe_template = normalize_debug_token(template_name)
-    return f"{safe_schema}.ch{chapter_index:04d}.r{retry_attempt:02d}.{safe_template}.{suffix}"
+    chapter_range = build_chapter_range_label(start_chapter_index, end_chapter_index)
+    return f"{safe_schema}.{chapter_range}.d{split_depth}.r{retry_attempt:02d}.{safe_template}.{suffix}"
+
+
+def build_batch_id(start_chapter_index: int, end_chapter_index: int, split_depth: int) -> str:
+    return f"{build_chapter_range_label(start_chapter_index, end_chapter_index)}-d{split_depth}"
+
+
+def build_chapter_range_label(start_chapter_index: int, end_chapter_index: int) -> str:
+    return f"ch{start_chapter_index:04d}-ch{end_chapter_index:04d}"
 
 
 def normalize_debug_token(value: str) -> str:
@@ -150,6 +226,21 @@ class RetryConfig:
 
 
 @dataclass(slots=True)
+class BatchingConfig:
+    enable_multi_chapter: bool = True
+    max_input_tokens: int = 12000
+    prompt_overhead_tokens: int = 1500
+    reserve_output_tokens: int = 3000
+    allow_oversize_single_chapter: bool = True
+    split_on_failure: bool = True
+    split_after_retry_exhausted: bool = True
+
+    @property
+    def chapter_token_budget(self) -> int:
+        return max(self.max_input_tokens - self.prompt_overhead_tokens - self.reserve_output_tokens, 0)
+
+
+@dataclass(slots=True)
 class AppConfig:
     input_epubs: list[Path]
     schema_paths: list[Path]
@@ -166,6 +257,7 @@ class AppConfig:
     streaming: bool = True
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
+    batching: BatchingConfig = field(default_factory=BatchingConfig)
 
 
 @dataclass(slots=True)

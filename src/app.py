@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 
 from extractor_graph import ExtractorGraph
-from models import AppConfig
+from models import AppConfig, BatchingConfig
 from task_runner import TaskRunner
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
@@ -43,6 +43,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     model = raw.get("model", {})
     runtime = raw.get("runtime", {})
     progress = raw.get("progress", {})
+    batching = raw.get("batching", {})
 
     return AppConfig(
         input_epubs=input_epubs,
@@ -60,7 +61,17 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         streaming=bool(model.get("streaming", True)),
         base_url=str(model.get("base_url", "https://api.openai.com/v1")),
         api_key=str(model.get("api_key", "")),
+        batching=BatchingConfig(
+            enable_multi_chapter=bool(batching.get("enable_multi_chapter", True)),
+            max_input_tokens=int(batching.get("max_input_tokens", 12000)),
+            prompt_overhead_tokens=int(batching.get("prompt_overhead_tokens", 1500)),
+            reserve_output_tokens=int(batching.get("reserve_output_tokens", 3000)),
+            allow_oversize_single_chapter=bool(batching.get("allow_oversize_single_chapter", True)),
+            split_on_failure=bool(batching.get("split_on_failure", True)),
+            split_after_retry_exhausted=bool(batching.get("split_after_retry_exhausted", True)),
+        ),
     )
+
 
 
 def ensure_project_layout(config_path: Path = DEFAULT_CONFIG_PATH, *, force: bool = False) -> Path:
@@ -106,6 +117,15 @@ def default_raw_config() -> dict[str, Any]:
         },
         "progress": {
             "emit_console_progress": True,
+        },
+        "batching": {
+            "enable_multi_chapter": True,
+            "max_input_tokens": 12000,
+            "prompt_overhead_tokens": 1500,
+            "reserve_output_tokens": 3000,
+            "allow_oversize_single_chapter": True,
+            "split_on_failure": True,
+            "split_after_retry_exhausted": True,
         },
     }
 

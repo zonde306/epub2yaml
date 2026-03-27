@@ -18,7 +18,8 @@ from llm_client import (  # noqa: E402
     normalize_base_url,
     read_http_error,
 )
-from models import AppConfig, Chapter, PromptTemplate  # noqa: E402
+from models import AppConfig, BatchingConfig, Chapter, ChapterBatch, PromptTemplate, TaskDefinition  # noqa: E402
+from progress_store import ProgressStore  # noqa: E402
 from prompt_builder import PromptBuilder  # noqa: E402
 from schema_loader import SchemaLoader  # noqa: E402
 from schema_validator import SchemaValidator  # noqa: E402
@@ -67,21 +68,25 @@ class WorkspaceManagerTests(unittest.TestCase):
 
             prompt_path = workspace.prompt_debug_path_for_attempt(
                 schema_name="characters",
-                chapter_index=1,
+                start_chapter_index=5,
+                end_chapter_index=9,
+                split_depth=1,
                 retry_attempt=2,
                 template_name="retry_format",
             )
             response_path = workspace.response_debug_path_for_attempt(
                 schema_name="characters",
-                chapter_index=1,
+                start_chapter_index=5,
+                end_chapter_index=9,
+                split_depth=1,
                 retry_attempt=2,
                 template_name="retry_format",
             )
 
             self.assertEqual(prompt_path.parent, workspace.debug_dir())
             self.assertEqual(response_path.parent, workspace.debug_dir())
-            self.assertEqual(prompt_path.name, "characters.ch0001.r02.retry_format.prompt.txt")
-            self.assertEqual(response_path.name, "characters.ch0001.r02.retry_format.response.yaml")
+            self.assertEqual(prompt_path.name, "characters.ch0005-ch0009.d1.r02.retry_format.prompt.txt")
+            self.assertEqual(response_path.name, "characters.ch0005-ch0009.d1.r02.retry_format.response.yaml")
 
 
 class SchemaLoaderTests(unittest.TestCase):
@@ -217,32 +222,82 @@ class PromptBuilderTests(unittest.TestCase):
             name="base",
             path=Path("prompts/base.md"),
             index=0,
-            content="章节={{chapter_title}} root={{root_key}} error={{error_summary}}\n{{output_rules}}",
+            content="章节={{chapter_title}} range={{batch_range}} count={{chapter_count}} root={{root_key}} error={{error_summary}}\n{{source_text}}\n{{output_rules}}",
         )
-        chapter = Chapter(
-            chapter_index=1,
-            chapter_id="ch0001-demo",
-            title="第一章",
-            text="正文",
-            source_path="chapter1.xhtml",
-            token_estimate=1,
+        batch = ChapterBatch.from_chapters(
+            [
+                Chapter(
+                    chapter_index=1,
+                    chapter_id="ch0001-demo",
+                    title="第一章",
+                    text="正文一",
+                    source_path="chapter1.xhtml",
+                    token_estimate=1,
+                ),
+                Chapter(
+                    chapter_index=2,
+                    chapter_id="ch0002-demo",
+                    title="第二章",
+                    text="正文二",
+                    source_path="chapter2.xhtml",
+                    token_estimate=1,
+                ),
+            ]
         )
         schema = SchemaLoader().load(Path("schemas/world.yaml"))
 
         prompt = PromptBuilder().build(
             template,
-            chapter=chapter,
+            batch=batch,
             schema_definition=schema,
             existing_yaml="{}",
             existing_worldinfo="{}",
             error_summary="schema validation failed",
         )
 
-        self.assertIn("章节=第一章", prompt)
+        self.assertIn("章节=第一章 ~ 第二章", prompt)
+        self.assertIn("range=ch0001-ch0002", prompt)
+        self.assertIn("count=2", prompt)
         self.assertIn("root=worldinfo", prompt)
         self.assertIn("error=schema validation failed", prompt)
+        self.assertIn("### Chapter 1", prompt)
+        self.assertIn("chapter_id: ch0001-demo", prompt)
+        self.assertIn("chapter_title: 第二章", prompt)
         self.assertIn("顶层只能包含 `worldinfo`", prompt)
         self.assertIn("其值必须是对象映射，而不是列表", prompt)
+
+
+class ProgressStoreTests(unittest.TestCase):
+    def test_mark_batch_completed_updates_batch_progress_fields(self) -> None:
+        store = ProgressStore()
+        progress = store.initialize(
+            Path(tempfile.gettempdir()) / "epub2dict-progress-store-test.yaml",
+            epub_path="input/book.epub",
+            workspace_root="workspace/book",
+            schema_path="schemas/world.yaml",
+            output_path="workspace/book/output/world.yaml",
+            stream_buffer_path="workspace/book/temp/world.stream.txt",
+            total_chapters=10,
+            max_attempts=3,
+        )
+        batch = ChapterBatch.from_chapters(
+            [
+                Chapter(3, "ch0003", "第三章", "A", "a.xhtml", 10),
+                Chapter(4, "ch0004", "第四章", "B", "b.xhtml", 10),
+            ],
+            split_depth=1,
+            parent_batch_id="ch0001-ch0004-d0",
+        )
+
+        updated = store.mark_batch_completed(progress, batch=batch, total_chapters=10)
+
+        self.assertEqual(updated["last_completed_chapter_index"], 4)
+        self.assertEqual(updated["last_completed_chapter_id"], "ch0004")
+        self.assertEqual(updated["current_batch_range"], "ch0003-ch0004")
+        self.assertEqual(updated["current_batch_depth"], 1)
+        self.assertEqual(updated["current_batch_parent_id"], "ch0001-ch0004-d0")
+        self.assertEqual(updated["batch_status"], "completed")
+        self.assertEqual(updated["current_chapter_index"], 5)
 
 
 class YamlStoreTests(unittest.TestCase):
@@ -346,6 +401,75 @@ class YamlStoreTests(unittest.TestCase):
 
 
 class TaskRunnerTests(unittest.TestCase):
+    def test_build_initial_batches_groups_chapters_without_splitting(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            batching=BatchingConfig(
+                enable_multi_chapter=True,
+                max_input_tokens=100,
+                prompt_overhead_tokens=10,
+                reserve_output_tokens=20,
+            ),
+        )
+        runner = TaskRunner(config)
+        chapters = [
+            Chapter(1, "ch0001", "第一章", "A", "a.xhtml", 30),
+            Chapter(2, "ch0002", "第二章", "B", "b.xhtml", 35),
+            Chapter(3, "ch0003", "第三章", "C", "c.xhtml", 20),
+            Chapter(4, "ch0004", "第四章", "D", "d.xhtml", 50),
+        ]
+        task = TaskDefinition(
+            epub_path=Path("input/book.epub"),
+            workspace=WorkspaceManager(Path("workspace")).ensure_workspace(Path("input/book.epub")),
+            schema_path=Path("schemas/world.yaml"),
+            prompt_template_paths=[],
+            output_path=Path("workspace/book/output/world.yaml"),
+            progress_path=Path("workspace/book/state/world.progress.yaml"),
+            stream_buffer_path=Path("workspace/book/temp/world.stream.txt"),
+        )
+
+        batches = runner._build_initial_batches(task, chapters)
+
+        self.assertEqual([batch.display_range for batch in batches], ["ch0001-ch0002", "ch0003-ch0004"])
+        self.assertEqual([batch.chapter_count for batch in batches], [2, 2])
+
+    def test_build_initial_batches_allows_oversize_single_chapter(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            batching=BatchingConfig(
+                enable_multi_chapter=True,
+                max_input_tokens=100,
+                prompt_overhead_tokens=10,
+                reserve_output_tokens=20,
+                allow_oversize_single_chapter=True,
+            ),
+        )
+        runner = TaskRunner(config)
+        task = TaskDefinition(
+            epub_path=Path("input/book.epub"),
+            workspace=WorkspaceManager(Path("workspace")).ensure_workspace(Path("input/book.epub")),
+            schema_path=Path("schemas/world.yaml"),
+            prompt_template_paths=[],
+            output_path=Path("workspace/book/output/world.yaml"),
+            progress_path=Path("workspace/book/state/world.progress.yaml"),
+            stream_buffer_path=Path("workspace/book/temp/world.stream.txt"),
+        )
+        chapters = [
+            Chapter(1, "ch0001", "第一章", "A", "a.xhtml", 90),
+            Chapter(2, "ch0002", "第二章", "B", "b.xhtml", 10),
+        ]
+
+        batches = runner._build_initial_batches(task, chapters)
+
+        self.assertEqual([batch.display_range for batch in batches], ["ch0001-ch0001", "ch0002-ch0002"])
+        self.assertEqual([batch.chapter_count for batch in batches], [1, 1])
+
     def test_collect_stream_writes_stream_and_debug_response_files(self) -> None:
         class StubStreamModelClient:
             def stream_yaml(self, prompt: str):
@@ -367,7 +491,7 @@ class TaskRunnerTests(unittest.TestCase):
             runner = TaskRunner(config, model_client=client)
 
             stream_buffer_path = workspace_root / "epub" / "temp" / "world.stream.txt"
-            response_debug_path = workspace_root / "epub" / "logs" / "debug" / "world.ch0001.r01.base.response.yaml"
+            response_debug_path = workspace_root / "epub" / "logs" / "debug" / "world.ch0001-ch0001.d0.r01.base.response.yaml"
 
             yaml_text, chunk_count = runner._collect_stream(stream_buffer_path, response_debug_path, "hello prompt")
 
