@@ -8,6 +8,11 @@ import yaml
 from models import MergeStats, SchemaDefinition
 
 
+class IndentedSafeDumper(yaml.SafeDumper):
+    def increase_indent(self, flow: bool = False, indentless: bool = False) -> Any:
+        return super().increase_indent(flow, False)
+
+
 class YamlStore:
     def load_yaml(self, path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
         if not path.exists():
@@ -32,12 +37,7 @@ class YamlStore:
 
     def write_yaml(self, path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        serialized = yaml.safe_dump(
-            data,
-            allow_unicode=True,
-            sort_keys=False,
-            indent=2,
-        )
+        serialized = self._dump_yaml(data)
         path.write_text(serialized, encoding="utf-8")
 
     def merge_increment(
@@ -67,12 +67,16 @@ class YamlStore:
         return merged, stats
 
     def dump_to_string(self, data: dict[str, Any]) -> str:
-        return yaml.safe_dump(
+        return self._dump_yaml(data).strip()
+
+    def _dump_yaml(self, data: dict[str, Any]) -> str:
+        return yaml.dump(
             data,
             allow_unicode=True,
             sort_keys=False,
             indent=2,
-        ).strip()
+            Dumper=IndentedSafeDumper,
+        )
 
     def _merge_node(self, current: Any, incoming: Any) -> Any:
         if isinstance(current, dict) and isinstance(incoming, dict):
