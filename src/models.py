@@ -81,6 +81,7 @@ class WorkspacePaths:
     source_dir: Path
     output_dir: Path
     state_dir: Path
+    checkpoint_dir: Path
     temp_dir: Path
     logs_dir: Path
 
@@ -89,6 +90,27 @@ class WorkspacePaths:
 
     def progress_path_for_schema(self, schema_name: str) -> Path:
         return self.state_dir / f"{schema_name}.progress.yaml"
+
+    def checkpoint_dir_for_id(self, checkpoint_id: str) -> Path:
+        return self.checkpoint_dir / checkpoint_id
+
+    def checkpoint_state_dir_for_id(self, checkpoint_id: str) -> Path:
+        return self.checkpoint_dir_for_id(checkpoint_id) / "state"
+
+    def checkpoint_output_dir_for_id(self, checkpoint_id: str) -> Path:
+        return self.checkpoint_dir_for_id(checkpoint_id) / "output"
+
+    def checkpoint_output_path_for_schema(self, schema_name: str, checkpoint_id: str) -> Path:
+        return self.checkpoint_output_dir_for_id(checkpoint_id) / f"{schema_name}.yaml"
+
+    def checkpoint_progress_path_for_schema(self, schema_name: str, checkpoint_id: str) -> Path:
+        return self.checkpoint_state_dir_for_id(checkpoint_id) / f"{schema_name}.progress.yaml"
+
+    def checkpoint_meta_path_for_schema(self, schema_name: str, checkpoint_id: str) -> Path:
+        return self.checkpoint_state_dir_for_id(checkpoint_id) / f"{schema_name}.meta.yaml"
+
+    def checkpoint_latest_path_for_schema(self, schema_name: str) -> Path:
+        return self.checkpoint_dir / f"{schema_name}.latest.yaml"
 
     def stream_buffer_path_for_schema(self, schema_name: str) -> Path:
         return self.temp_dir / f"{schema_name}.stream.txt"
@@ -158,6 +180,10 @@ def build_batch_id(start_chapter_index: int, end_chapter_index: int, split_depth
     return f"{build_chapter_range_label(start_chapter_index, end_chapter_index)}-d{split_depth}"
 
 
+def build_checkpoint_id(chapter_index: int) -> str:
+    return f"ch{chapter_index:04d}"
+
+
 def build_chapter_range_label(start_chapter_index: int, end_chapter_index: int) -> str:
     return f"ch{start_chapter_index:04d}-ch{end_chapter_index:04d}"
 
@@ -165,6 +191,7 @@ def build_chapter_range_label(start_chapter_index: int, end_chapter_index: int) 
 def normalize_debug_token(value: str) -> str:
     normalized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip().lower())
     return normalized.strip("-._") or "value"
+
 
 
 @dataclass(slots=True)
@@ -234,6 +261,8 @@ class BatchingConfig:
     allow_oversize_single_chapter: bool = True
     split_on_failure: bool = True
     split_after_retry_exhausted: bool = True
+    enable_checkpoint: bool = False
+    checkpoint_every_n_chapters: int = 10
 
     @property
     def chapter_token_budget(self) -> int:

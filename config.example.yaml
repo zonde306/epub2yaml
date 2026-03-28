@@ -31,3 +31,5 @@ batching:
   allow_oversize_single_chapter: true
   split_on_failure: true
   split_after_retry_exhausted: true
+  enable_checkpoint: false
+  checkpoint_every_n_chapters: 10

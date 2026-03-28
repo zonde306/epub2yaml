@@ -9,8 +9,9 @@
 - 使用 `prompts/` 模板构造提示词
 - 支持流式缓冲、最小结构校验、增量替换合并、状态落盘与恢复
 - 已支持 OpenAI-compatible Chat Completions 流式 API 接入
-- 已提供初始化 / 添加 EPUB / 运行 / 测试命令，降低手动操作成本
+- 已提供初始化 / 添加 EPUB / 运行 / 恢复 / 测试命令，降低手动操作成本
 - 已增强控制台日志与文件日志，便于定位错误原因
+- 已支持 checkpoint 自动快照与手动恢复
 
 当前版本已经完成 MVP 骨架、基础测试、本地可运行入口，以及真实 API 客户端接入。
 
@@ -32,6 +33,7 @@
 
 - `src/app.py`：程序入口与命令行子命令
 - `src/task_runner.py`：单个 `EPUB × schema` 任务执行器
+- `src/checkpoint_store.py`：checkpoint 保存与恢复
 - `src/epub_reader.py`：EPUB 章节提取
 - `src/schema_loader.py`：schema 装载与字段提取
 - `src/schema_validator.py`：最小结构校验
@@ -82,7 +84,8 @@ pip install pyyaml lxml httpx
 - 模板顺序尝试
 - 有界重试骨架
 - OpenAI-compatible 流式 API 接入
-- 命令行初始化 / 添加输入 / 运行 / 测试
+- 命令行初始化 / 添加输入 / 运行 / 恢复 / 测试
+- checkpoint 自动保存与手动恢复
 - 单元测试
 
 ### 尚未实现 / 仍待增强
@@ -129,6 +132,16 @@ runtime:
   retry_backoff_seconds: 3
 progress:
   emit_console_progress: true
+batching:
+  enable_multi_chapter: true
+  max_input_tokens: 12000
+  prompt_overhead_tokens: 1500
+  reserve_output_tokens: 3000
+  allow_oversize_single_chapter: true
+  split_on_failure: true
+  split_after_retry_exhausted: true
+  enable_checkpoint: false
+  checkpoint_every_n_chapters: 10
 ```
 
 ### 字段说明
@@ -184,6 +197,12 @@ progress:
 
 #### `progress.emit_console_progress`
 是否输出控制台进度日志。
+
+#### `batching.enable_checkpoint`
+是否启用 checkpoint 自动保存与窗口约束。关闭时保持原有行为。
+
+#### `batching.checkpoint_every_n_chapters`
+checkpoint 窗口大小，同时决定自动保存边界。例如设置为 `10` 时，处理到第 10、20、30 章会自动保存；最后一段不足 10 章时也会在任务结束时保存。
 
 ---
 
@@ -244,7 +263,21 @@ python src/app.py
 python src/app.py --config config.example.yaml run
 ```
 
-### 5.4 运行测试
+### 5.4 恢复到指定 checkpoint
+
+```bash
+python src/app.py restore --epub input/book.epub --schema schemas/world.yaml --checkpoint ch0010
+```
+
+恢复到最近一次 checkpoint：
+
+```bash
+python src/app.py restore --epub input/book.epub --schema schemas/world.yaml --latest
+```
+
+该命令只会覆盖当前 `output` 与 `progress`，并清理对应 schema 的流式缓冲文件；恢复完成后需要由用户重新执行 `run`。
+
+### 5.5 运行测试
 
 ```bash
 python src/app.py test
@@ -281,6 +314,7 @@ python src/app.py add-epub tests/文件.epub
 - `model.base_url`
 - `model.api_key`
 - 如有需要，修改 `model.name`
+- 如有需要，开启 `batching.enable_checkpoint`
 
 ### 步骤 4：运行任务
 
@@ -288,7 +322,16 @@ python src/app.py add-epub tests/文件.epub
 python src/app.py run
 ```
 
-### 步骤 5：查看结果
+### 步骤 5：恢复并继续
+
+如果需要回退到稳定快照：
+
+```bash
+python src/app.py restore --epub input/novel.epub --schema schemas/world.yaml --latest
+python src/app.py run
+```
+
+### 步骤 6：查看结果
 
 输出会出现在 `workspace/<epub_name>/` 目录下。
 
@@ -337,17 +380,17 @@ No tasks found. Please check config.yaml input_epubs and schema_paths.
 2. 为每个 schema 建立一个任务
 3. 顺序处理章节
 4. 通过 OpenAI-compatible 流式接口拉取模型输出
-5. 生成输出 YAML、进度 YAML、流式临时文件与日志文件
+5. 生成输出 YAML、进度 YAML、流式临时文件、checkpoint 快照与日志文件
 
 控制台会打印类似进度信息：
 
 ```text
-[2026-03-27 17:00:00] [epub][characters] chapter attempt chapter=1/3 retry=1/3 template=base
-[2026-03-27 17:00:01] [epub][characters] stream failed: http error 401: unauthorized
-[epub][characters] 0/3 template=base status=running retries=0 replaced=0 appended=0 last_error=stream failed: http error 401: unauthorized
+[2026-03-27 17:00:00] [epub][characters] batch attempt range=ch0001-ch0003 depth=0 retry=1/3 template=base
+[2026-03-27 17:00:01] [epub][characters] merge completed range=ch0001-ch0003 replaced=0 appended=2
+[2026-03-27 17:00:02] [epub][characters] checkpoint saved id=ch0003 range=ch0001-ch0003
 ```
 
-相比之前只显示 `status=failed`，现在会直接带出关键错误原因。
+相比之前只显示 `status=failed`，现在会直接带出关键错误原因与 checkpoint 保存日志。
 
 ---
 
@@ -361,21 +404,22 @@ No tasks found. Please check config.yaml input_epubs and schema_paths.
 
 - `task started`
 - `task prepared`
-- `chapter start`
-- `chapter attempt`
+- `batch start`
+- `batch attempt`
 - `stream completed`
 - `yaml parse failed`
 - `schema validation failed`
 - `merge completed`
-- `chapter completed`
-- `chapter failed`
+- `checkpoint saved`
+- `batch completed`
+- `batch failed`
 - `task failed`
 
 这样即使失败，也能直接看到失败发生在哪个阶段。
 
 ### 9.2 进度行中的错误摘要
 
-[`TaskRunner._emit_progress()`](src/task_runner.py:228) 现在会把 `last_error` 一并输出到控制台。
+[`TaskRunner._emit_progress()`](src/task_runner.py:492) 现在会把 `last_error` 一并输出到控制台。
 
 例如：
 
@@ -391,7 +435,7 @@ No tasks found. Please check config.yaml input_epubs and schema_paths.
 workspace/<epub_name>/logs/run.log
 ```
 
-日志由 [`TaskRunner._log()`](src/task_runner.py:250) 写入，可用于事后排查。
+日志由 [`TaskRunner._log()`](src/task_runner.py:518) 写入，可用于事后排查。
 
 ### 9.4 状态文件中的错误
 
@@ -407,6 +451,8 @@ workspace/<epub_name>/state/<schema>.progress.yaml
 - `retry.last_error`
 - `validation.last_result`
 - `stream.last_receive_status`
+- `checkpoint.last_saved_id`
+- `checkpoint.last_restored_id`
 
 ### 9.5 推荐排查顺序
 
@@ -421,7 +467,8 @@ status=failed
 1. 控制台最近一条 `last_error`
 2. `workspace/<epub_name>/logs/run.log`
 3. `workspace/<epub_name>/state/*.progress.yaml`
-4. `workspace/<epub_name>/temp/*.stream.txt`
+4. `workspace/<epub_name>/checkpoint/`
+5. `workspace/<epub_name>/temp/*.stream.txt`
 
 ---
 
@@ -440,6 +487,14 @@ workspace/
     state/
       characters.progress.yaml
       world.progress.yaml
+    checkpoint/
+      ch0010/
+        state/
+          world.progress.yaml
+          world.meta.yaml
+        output/
+          world.yaml
+      world.latest.yaml
     temp/
       characters.stream.txt
       world.stream.txt
@@ -458,15 +513,18 @@ workspace/
 #### `state/`
 保存章节进度、最近错误、重试状态、模板状态、合并统计等。
 
+#### `checkpoint/`
+保存按章节窗口自动生成的稳定快照。每个 checkpoint 都包含对应 schema 的 `output`、`progress` 和 `meta` 文件，同时用 `<schema>.latest.yaml` 记录最近一次快照。
+
 #### `temp/`
 保存当前章节的流式输出缓冲。
 
 #### `logs/`
-预留运行日志目录。
+保存运行日志与调试文件。
 
 ---
 
-## 10. 输出语义说明
+## 11. 输出语义说明
 
 当前采用的是**节点级增量替换**，不是字段级 patch。
 
@@ -497,7 +555,7 @@ workspace/
 
 ---
 
-## 11. 恢复机制说明
+## 12. 恢复机制说明
 
 当 [`config.yaml`](config.yaml) 中的 `runtime.resume: true` 时：
 
@@ -505,11 +563,18 @@ workspace/
 - 若存在未完成的流式缓冲文件，则会先清理再重新处理当前章节
 - 若正式输出已存在，会继续在已有 YAML 基础上做整节点替换/追加
 
-这使得长任务中断后可以继续运行，而不必每次从头开始。
+当 [`config.yaml`](config.yaml) 中启用 `batching.enable_checkpoint: true` 时，还会增加：
+
+- batch 不会跨越 checkpoint 窗口边界
+- 处理到窗口末尾时自动保存 checkpoint
+- 任务最后一个窗口不足 `N` 章时也会保存 checkpoint
+- 可通过 `restore` 命令把当前 `output` 和 `progress` 覆盖回历史稳定快照
+
+恢复命令不会自动继续运行；恢复完成后请手动重新执行 `run`。
 
 ---
 
-## 12. API 接入说明
+## 13. API 接入说明
 
 当前已经支持 OpenAI-compatible Chat Completions 流式接口。
 
@@ -567,7 +632,7 @@ model:
 
 ---
 
-## 13. 运行测试
+## 14. 运行测试
 
 执行单元测试：
 
@@ -588,13 +653,15 @@ python -m unittest discover -s tests -v
 - schema 校验
 - prompt 渲染
 - YAML 增量合并
+- checkpoint 保存与恢复
+- checkpoint 窗口限制
 - API 客户端辅助函数
 - API 客户端构造逻辑
 - 命令入口相关行为的基础能力
 
 ---
 
-## 14. 常见问题
+## 15. 常见问题
 
 ### Q1：为什么运行后没有结果？
 通常是因为 [`config.yaml`](config.yaml) 中的 `input_epubs` 还是空列表。
@@ -623,6 +690,9 @@ python src/app.py add-epub <你的epub路径>
 python src/app.py run
 ```
 
+### Q8：checkpoint 恢复后为什么没有自动继续跑？
+这是有意设计。`restore` 只负责把状态恢复到稳定点，避免额外副作用；恢复完成后请手动执行 `python src/app.py run`。
+
 ---
 
 ## 16. 推荐使用流程
@@ -631,12 +701,14 @@ python src/app.py run
 
 1. 执行 `python src/app.py init`
 2. 执行 `python src/app.py add-epub <epub路径>`
-3. 修改 [`config.yaml`](config.yaml) 中的 API 配置
+3. 修改 [`config.yaml`](config.yaml) 中的 API 配置与 checkpoint 配置
 4. 执行 `python src/app.py run`
 5. 失败时优先查看控制台 `last_error`
 6. 再查看 `workspace/<epub_name>/logs/run.log`
 7. 必要时查看 `workspace/<epub_name>/state/*.progress.yaml`
-8. 需要自检时执行 `python src/app.py test`
+8. 需要回退时执行 `python src/app.py restore --epub <epub路径> --schema <schema路径> --latest`
+9. 恢复后重新执行 `python src/app.py run`
+10. 需要自检时执行 `python src/app.py test`
 
 ---
 

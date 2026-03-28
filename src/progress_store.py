@@ -19,6 +19,7 @@ class ProgressStore:
         data = yaml.safe_load(content) or {}
         if not isinstance(data, dict):
             raise ValueError(f"progress root must be mapping: {path}")
+        self._ensure_checkpoint_metadata(data)
         return data
 
     def initialize(
@@ -32,6 +33,8 @@ class ProgressStore:
         stream_buffer_path: str,
         total_chapters: int,
         max_attempts: int,
+        checkpoint_enabled: bool = False,
+        checkpoint_every_n_chapters: int = 0,
     ) -> dict[str, Any]:
         data = {
             "epub_path": epub_path,
@@ -75,6 +78,14 @@ class ProgressStore:
                 "replaced_nodes": 0,
                 "appended_nodes": 0,
             },
+            "checkpoint": {
+                "enabled": checkpoint_enabled,
+                "every_n_chapters": checkpoint_every_n_chapters,
+                "last_saved_id": "",
+                "last_saved_chapter_index": 0,
+                "last_restored_id": "",
+                "last_restored_at": "",
+            },
             "updated_at": utc_now_iso(),
         }
         self.save(path, data)
@@ -82,6 +93,7 @@ class ProgressStore:
 
     def save(self, path: Path, data: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_checkpoint_metadata(data)
         data["updated_at"] = utc_now_iso()
         serialized = yaml.safe_dump(data, allow_unicode=True, sort_keys=False, indent=2)
         path.write_text(serialized, encoding="utf-8")
@@ -154,6 +166,18 @@ class ProgressStore:
         data["batch_status"] = "completed"
         return data
 
+    def mark_checkpoint_saved(self, data: dict[str, Any], *, checkpoint_id: str, chapter_index: int) -> dict[str, Any]:
+        checkpoint = self._ensure_checkpoint_metadata(data)
+        checkpoint["last_saved_id"] = checkpoint_id
+        checkpoint["last_saved_chapter_index"] = chapter_index
+        return data
+
+    def mark_checkpoint_restored(self, data: dict[str, Any], *, checkpoint_id: str, restored_at: str | None = None) -> dict[str, Any]:
+        checkpoint = self._ensure_checkpoint_metadata(data)
+        checkpoint["last_restored_id"] = checkpoint_id
+        checkpoint["last_restored_at"] = restored_at or utc_now_iso()
+        return data
+
     def mark_batch_split(self, data: dict[str, Any], *, batch: ChapterBatch, reason: str) -> dict[str, Any]:
         self._set_batch_context(data, batch)
         data["status"] = "splitting"
@@ -183,6 +207,19 @@ class ProgressStore:
         data["current_batch_range"] = batch.display_range
         data["current_batch_depth"] = batch.split_depth
         data["current_batch_parent_id"] = batch.parent_batch_id
+
+    def _ensure_checkpoint_metadata(self, data: dict[str, Any]) -> dict[str, Any]:
+        checkpoint = data.get("checkpoint")
+        if not isinstance(checkpoint, dict):
+            checkpoint = {}
+            data["checkpoint"] = checkpoint
+        checkpoint.setdefault("enabled", False)
+        checkpoint.setdefault("every_n_chapters", 0)
+        checkpoint.setdefault("last_saved_id", "")
+        checkpoint.setdefault("last_saved_chapter_index", 0)
+        checkpoint.setdefault("last_restored_id", "")
+        checkpoint.setdefault("last_restored_at", "")
+        return checkpoint
 
 
 def calculate_progress(completed: int, total: int) -> float:

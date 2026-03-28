@@ -6,8 +6,12 @@ import unittest
 from pathlib import Path
 from urllib import error
 
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from app import restore_command  # noqa: E402
+from checkpoint_store import CheckpointStore  # noqa: E402
 from llm_client import (  # noqa: E402
     ApiStreamError,
     OpenAICompatibleStreamModelClient,
@@ -299,6 +303,33 @@ class ProgressStoreTests(unittest.TestCase):
         self.assertEqual(updated["batch_status"], "completed")
         self.assertEqual(updated["current_chapter_index"], 5)
 
+    def test_initialize_includes_checkpoint_metadata(self) -> None:
+        store = ProgressStore()
+        progress = store.initialize(
+            Path(tempfile.gettempdir()) / "epub2dict-progress-store-checkpoint.yaml",
+            epub_path="input/book.epub",
+            workspace_root="workspace/book",
+            schema_path="schemas/world.yaml",
+            output_path="workspace/book/output/world.yaml",
+            stream_buffer_path="workspace/book/temp/world.stream.txt",
+            total_chapters=10,
+            max_attempts=3,
+            checkpoint_enabled=True,
+            checkpoint_every_n_chapters=3,
+        )
+
+        self.assertEqual(
+            progress["checkpoint"],
+            {
+                "enabled": True,
+                "every_n_chapters": 3,
+                "last_saved_id": "",
+                "last_saved_chapter_index": 0,
+                "last_restored_id": "",
+                "last_restored_at": "",
+            },
+        )
+
 
 class YamlStoreTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -436,6 +467,45 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual([batch.display_range for batch in batches], ["ch0001-ch0002", "ch0003-ch0004"])
         self.assertEqual([batch.chapter_count for batch in batches], [2, 2])
 
+    def test_build_initial_batches_respects_checkpoint_windows(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            batching=BatchingConfig(
+                enable_multi_chapter=True,
+                max_input_tokens=1000,
+                prompt_overhead_tokens=10,
+                reserve_output_tokens=20,
+                enable_checkpoint=True,
+                checkpoint_every_n_chapters=3,
+            ),
+        )
+        runner = TaskRunner(config)
+        chapters = [
+            Chapter(1, "ch0001", "第一章", "A", "a.xhtml", 10),
+            Chapter(2, "ch0002", "第二章", "B", "b.xhtml", 10),
+            Chapter(3, "ch0003", "第三章", "C", "c.xhtml", 10),
+            Chapter(4, "ch0004", "第四章", "D", "d.xhtml", 10),
+            Chapter(5, "ch0005", "第五章", "E", "e.xhtml", 10),
+            Chapter(6, "ch0006", "第六章", "F", "f.xhtml", 10),
+            Chapter(7, "ch0007", "第七章", "G", "g.xhtml", 10),
+        ]
+        task = TaskDefinition(
+            epub_path=Path("input/book.epub"),
+            workspace=WorkspaceManager(Path("workspace")).ensure_workspace(Path("input/book.epub")),
+            schema_path=Path("schemas/world.yaml"),
+            prompt_template_paths=[],
+            output_path=Path("workspace/book/output/world.yaml"),
+            progress_path=Path("workspace/book/state/world.progress.yaml"),
+            stream_buffer_path=Path("workspace/book/temp/world.stream.txt"),
+        )
+
+        batches = runner._build_initial_batches(task, chapters)
+
+        self.assertEqual([batch.display_range for batch in batches], ["ch0001-ch0003", "ch0004-ch0006", "ch0007-ch0007"])
+
     def test_build_initial_batches_allows_oversize_single_chapter(self) -> None:
         config = AppConfig(
             input_epubs=[],
@@ -470,6 +540,22 @@ class TaskRunnerTests(unittest.TestCase):
         self.assertEqual([batch.display_range for batch in batches], ["ch0001-ch0001", "ch0002-ch0002"])
         self.assertEqual([batch.chapter_count for batch in batches], [1, 1])
 
+    def test_should_save_checkpoint_on_window_boundary_and_final_batch(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            batching=BatchingConfig(enable_checkpoint=True, checkpoint_every_n_chapters=3),
+        )
+        runner = TaskRunner(config)
+
+        progress_boundary = {"last_completed_chapter_index": 3, "checkpoint": {"last_saved_chapter_index": 0}}
+        progress_final = {"last_completed_chapter_index": 7, "checkpoint": {"last_saved_chapter_index": 6}}
+
+        self.assertTrue(runner._should_save_checkpoint(progress=progress_boundary, total_chapters=7))
+        self.assertTrue(runner._should_save_checkpoint(progress=progress_final, total_chapters=7))
+
     def test_collect_stream_writes_stream_and_debug_response_files(self) -> None:
         class StubStreamModelClient:
             def stream_yaml(self, prompt: str):
@@ -501,6 +587,104 @@ class TaskRunnerTests(unittest.TestCase):
             self.assertEqual(stream_buffer_path.read_text(encoding="utf-8"), yaml_text)
             self.assertEqual(response_debug_path.read_text(encoding="utf-8"), yaml_text)
 
+
+class CheckpointStoreTests(unittest.TestCase):
+    def test_save_checkpoint_creates_snapshot_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace_root = root / "workspace"
+            epub_path = root / "book.epub"
+            epub_path.write_bytes(b"dummy")
+
+            workspace = WorkspaceManager(workspace_root).ensure_workspace(epub_path)
+            task = TaskDefinition(
+                epub_path=epub_path,
+                workspace=workspace,
+                schema_path=Path("schemas/world.yaml"),
+                prompt_template_paths=[],
+                output_path=workspace.output_path_for_schema("world"),
+                progress_path=workspace.progress_path_for_schema("world"),
+                stream_buffer_path=workspace.stream_buffer_path_for_schema("world"),
+            )
+            task.output_path.write_text("worldinfo: {}\n", encoding="utf-8")
+            progress = {
+                "last_completed_chapter_index": 3,
+                "checkpoint": {
+                    "enabled": True,
+                    "every_n_chapters": 3,
+                    "last_saved_id": "ch0003",
+                    "last_saved_chapter_index": 3,
+                    "last_restored_id": "",
+                    "last_restored_at": "",
+                },
+            }
+            task.progress_path.write_text(yaml.safe_dump(progress, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+            metadata = CheckpointStore().save_checkpoint(task, schema_name="world", progress=progress, total_chapters=7)
+
+            checkpoint_id = metadata["checkpoint_id"]
+            self.assertEqual(checkpoint_id, "ch0003")
+            self.assertTrue(task.workspace.checkpoint_output_path_for_schema("world", checkpoint_id).exists())
+            self.assertTrue(task.workspace.checkpoint_progress_path_for_schema("world", checkpoint_id).exists())
+            self.assertTrue(task.workspace.checkpoint_meta_path_for_schema("world", checkpoint_id).exists())
+
+    def test_restore_command_overwrites_runtime_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            workspace_root = root / "workspace"
+            config_path = root / "config.yaml"
+            config_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "input_epubs": [],
+                        "schema_paths": ["schemas/world.yaml"],
+                        "prompt_templates": [],
+                        "workspace_root": str(workspace_root).replace("\\", "/"),
+                    },
+                    allow_unicode=True,
+                    sort_keys=False,
+                ),
+                encoding="utf-8",
+            )
+            epub_path = root / "book.epub"
+            epub_path.write_bytes(b"dummy")
+
+            workspace_manager = WorkspaceManager(workspace_root)
+            workspace = workspace_manager.ensure_workspace(epub_path)
+            output_path = workspace.output_path_for_schema("world")
+            progress_path = workspace.progress_path_for_schema("world")
+            stream_buffer_path = workspace.stream_buffer_path_for_schema("world")
+            output_path.write_text("worldinfo:\n  wrong: {}\n", encoding="utf-8")
+            progress_path.write_text("last_completed_chapter_index: 7\n", encoding="utf-8")
+            stream_buffer_path.write_text("stale", encoding="utf-8")
+
+            checkpoint_id = "ch0003"
+            checkpoint_output_path = workspace.checkpoint_output_path_for_schema("world", checkpoint_id)
+            checkpoint_progress_path = workspace.checkpoint_progress_path_for_schema("world", checkpoint_id)
+            checkpoint_meta_path = workspace.checkpoint_meta_path_for_schema("world", checkpoint_id)
+            checkpoint_output_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_progress_path.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_output_path.write_text("worldinfo:\n  restored: {}\n", encoding="utf-8")
+            checkpoint_progress_path.write_text("last_completed_chapter_index: 3\n", encoding="utf-8")
+            checkpoint_meta_path.write_text(
+                yaml.safe_dump({"checkpoint_id": checkpoint_id, "chapter_index": 3}, allow_unicode=True, sort_keys=False),
+                encoding="utf-8",
+            )
+
+            exit_code = restore_command(
+                config_path,
+                epub_path=epub_path,
+                schema_path=Path("schemas/world.yaml"),
+                checkpoint_id=checkpoint_id,
+                latest=False,
+            )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "worldinfo:\n  restored: {}\n")
+            restored_progress = yaml.safe_load(progress_path.read_text(encoding="utf-8"))
+            self.assertEqual(restored_progress["last_completed_chapter_index"], 3)
+            self.assertEqual(restored_progress["checkpoint"]["last_restored_id"], checkpoint_id)
+            self.assertFalse(stream_buffer_path.exists())
 
 class LlmClientTests(unittest.TestCase):
     def test_detect_root_key(self) -> None:

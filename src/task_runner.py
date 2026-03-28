@@ -5,9 +5,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from checkpoint_store import CheckpointStore
 from epub_reader import extract_epub
 from llm_client import build_model_client
-from models import AppConfig, Chapter, ChapterBatch, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition
+from models import AppConfig, Chapter, ChapterBatch, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition, build_checkpoint_id
 from progress_store import ProgressStore
 from prompt_builder import PromptBuilder
 from prompt_loader import PromptLoader
@@ -30,6 +31,7 @@ class TaskRunner:
         yaml_store: YamlStore | None = None,
         progress_store: ProgressStore | None = None,
         workspace_manager: WorkspaceManager | None = None,
+        checkpoint_store: CheckpointStore | None = None,
     ) -> None:
         self.config = config
         self.model_client = model_client or build_model_client(config)
@@ -40,6 +42,7 @@ class TaskRunner:
         self.yaml_store = yaml_store or YamlStore()
         self.progress_store = progress_store or ProgressStore()
         self.workspace_manager = workspace_manager or WorkspaceManager(config.workspace_root)
+        self.checkpoint_store = checkpoint_store or CheckpointStore()
 
     def build_tasks(self) -> list[TaskDefinition]:
         tasks: list[TaskDefinition] = []
@@ -118,11 +121,20 @@ class TaskRunner:
             self._log(task, "batching disabled by zero chapter token budget, fallback to single chapter batches")
             return [ChapterBatch.from_chapters([chapter]) for chapter in chapters]
 
+        checkpoint_window_size = self._checkpoint_window_size()
         batches: list[ChapterBatch] = []
         pending: list[Chapter] = []
         pending_tokens = 0
 
         for chapter in chapters:
+            if pending and checkpoint_window_size > 0:
+                pending_window_index = self._chapter_window_index(pending[0].chapter_index)
+                chapter_window_index = self._chapter_window_index(chapter.chapter_index)
+                if chapter_window_index != pending_window_index:
+                    batches.append(ChapterBatch.from_chapters(pending))
+                    pending = []
+                    pending_tokens = 0
+
             if chapter.token_estimate > budget:
                 if not self.config.batching.allow_oversize_single_chapter:
                     raise ValueError(
@@ -154,6 +166,7 @@ class TaskRunner:
             batches.append(ChapterBatch.from_chapters(pending))
 
         return batches
+
 
     def _run_batch_tree(
         self,
@@ -335,12 +348,20 @@ class TaskRunner:
                     total_chapters=total_chapters,
                 )
                 self.progress_store.save(task.progress_path, progress)
+                checkpoint_id = self._maybe_save_checkpoint(
+                    task,
+                    schema_definition=schema_definition,
+                    progress=progress,
+                    total_chapters=total_chapters,
+                )
                 self._emit_progress(task, schema_definition, progress, template.name)
                 self.workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
                 self._log(
                     task,
                     f"batch completed range={batch.display_range} depth={batch.split_depth} end_chapter={batch.end_chapter_index}/{total_chapters}",
                 )
+                if checkpoint_id:
+                    self._log(task, f"checkpoint saved id={checkpoint_id} range={batch.display_range}")
                 return {"progress": progress}
 
             batch_retry += 1
@@ -402,7 +423,65 @@ class TaskRunner:
             stream_buffer_path=str(task.stream_buffer_path).replace("\\", "/"),
             total_chapters=total_chapters,
             max_attempts=self.config.retry_count,
+            checkpoint_enabled=self.config.batching.enable_checkpoint,
+            checkpoint_every_n_chapters=self._checkpoint_window_size(),
         )
+
+    def _checkpoint_window_size(self) -> int:
+        if not self.config.batching.enable_checkpoint:
+            return 0
+        return max(int(self.config.batching.checkpoint_every_n_chapters), 0)
+
+    def _chapter_window_index(self, chapter_index: int) -> int:
+        checkpoint_window_size = self._checkpoint_window_size()
+        if checkpoint_window_size <= 0:
+            return 0
+        return max((chapter_index - 1) // checkpoint_window_size, 0)
+
+    def _should_save_checkpoint(self, *, progress: dict[str, Any], total_chapters: int) -> bool:
+        checkpoint_window_size = self._checkpoint_window_size()
+        if checkpoint_window_size <= 0:
+            return False
+
+        chapter_index = int(progress.get("last_completed_chapter_index", 0))
+        if chapter_index <= 0:
+            return False
+
+        checkpoint = progress.get("checkpoint", {})
+        last_saved_chapter_index = int(checkpoint.get("last_saved_chapter_index", 0)) if isinstance(checkpoint, dict) else 0
+        if chapter_index <= last_saved_chapter_index:
+            return False
+        if chapter_index >= total_chapters:
+            return True
+        return chapter_index % checkpoint_window_size == 0
+
+    def _maybe_save_checkpoint(
+        self,
+        task: TaskDefinition,
+        *,
+        schema_definition: SchemaDefinition,
+        progress: dict[str, Any],
+        total_chapters: int,
+    ) -> str:
+        if not self._should_save_checkpoint(progress=progress, total_chapters=total_chapters):
+            return ""
+
+        chapter_index = int(progress.get("last_completed_chapter_index", 0))
+        checkpoint_id = build_checkpoint_id(chapter_index)
+        progress = self.progress_store.mark_checkpoint_saved(
+            progress,
+            checkpoint_id=checkpoint_id,
+            chapter_index=chapter_index,
+        )
+        self.progress_store.save(task.progress_path, progress)
+
+        metadata = self.checkpoint_store.save_checkpoint(
+            task,
+            schema_name=schema_definition.schema_name,
+            progress=progress,
+            total_chapters=total_chapters,
+        )
+        return str(metadata.get("checkpoint_id", ""))
 
     def _load_existing_worldinfo(self, task: TaskDefinition) -> str:
         world_path = task.workspace.output_dir / "world.yaml"

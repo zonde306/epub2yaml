@@ -19,10 +19,11 @@ class WorkspaceManager:
         source_dir = root / "source"
         output_dir = root / "output"
         state_dir = root / "state"
+        checkpoint_dir = root / "checkpoint"
         temp_dir = root / "temp"
         logs_dir = root / "logs"
 
-        for directory in (self.workspace_root, root, source_dir, output_dir, state_dir, temp_dir, logs_dir):
+        for directory in (self.workspace_root, root, source_dir, output_dir, state_dir, checkpoint_dir, temp_dir, logs_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         debug_dir = logs_dir / "debug"
@@ -38,6 +39,7 @@ class WorkspaceManager:
             source_dir=source_dir,
             output_dir=output_dir,
             state_dir=state_dir,
+            checkpoint_dir=checkpoint_dir,
             temp_dir=temp_dir,
             logs_dir=logs_dir,
         )

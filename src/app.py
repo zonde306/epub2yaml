@@ -10,9 +10,12 @@ from typing import Any
 
 import yaml
 
+from checkpoint_store import CheckpointStore
 from extractor_graph import ExtractorGraph
-from models import AppConfig, BatchingConfig
+from models import AppConfig, BatchingConfig, TaskDefinition
+from progress_store import ProgressStore
 from task_runner import TaskRunner
+from workspace_manager import WorkspaceManager
 
 DEFAULT_CONFIG_PATH = Path("config.yaml")
 DEFAULT_EXAMPLE_CONFIG_PATH = Path("config.example.yaml")
@@ -69,6 +72,8 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             allow_oversize_single_chapter=bool(batching.get("allow_oversize_single_chapter", True)),
             split_on_failure=bool(batching.get("split_on_failure", True)),
             split_after_retry_exhausted=bool(batching.get("split_after_retry_exhausted", True)),
+            enable_checkpoint=bool(batching.get("enable_checkpoint", False)),
+            checkpoint_every_n_chapters=int(batching.get("checkpoint_every_n_chapters", 10)),
         ),
     )
 
@@ -126,6 +131,8 @@ def default_raw_config() -> dict[str, Any]:
             "allow_oversize_single_chapter": True,
             "split_on_failure": True,
             "split_after_retry_exhausted": True,
+            "enable_checkpoint": False,
+            "checkpoint_every_n_chapters": 10,
         },
     }
 
@@ -192,6 +199,56 @@ def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     return 0 if failed_count == 0 else 2
 
 
+def restore_command(
+    config_path: Path,
+    *,
+    epub_path: Path,
+    schema_path: Path,
+    checkpoint_id: str | None = None,
+    latest: bool = False,
+) -> int:
+    config = load_config(config_path)
+    workspace_manager = WorkspaceManager(config.workspace_root)
+    checkpoint_store = CheckpointStore()
+    progress_store = ProgressStore()
+
+    task = build_task_definition(workspace_manager, epub_path=epub_path, schema_path=schema_path)
+    snapshot = checkpoint_store.restore_checkpoint(
+        task,
+        schema_name=schema_path.stem,
+        checkpoint_id=checkpoint_id,
+        latest=latest,
+    )
+
+    if task.stream_buffer_path.exists():
+        workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
+
+    progress = progress_store.load(task.progress_path)
+    progress = progress_store.mark_checkpoint_restored(progress, checkpoint_id=str(snapshot["checkpoint_id"]))
+    progress_store.save(task.progress_path, progress)
+
+    print(
+        "checkpoint 恢复完成: "
+        f"epub={epub_path} schema={schema_path} checkpoint={snapshot['checkpoint_id']} "
+        f"output={task.output_path} progress={task.progress_path}"
+    )
+    return 0
+
+
+def build_task_definition(workspace_manager: WorkspaceManager, *, epub_path: Path, schema_path: Path) -> TaskDefinition:
+    workspace = workspace_manager.ensure_workspace(epub_path)
+    schema_name = schema_path.stem
+    return TaskDefinition(
+        epub_path=epub_path,
+        workspace=workspace,
+        schema_path=schema_path,
+        prompt_template_paths=[],
+        output_path=workspace.output_path_for_schema(schema_name),
+        progress_path=workspace.progress_path_for_schema(schema_name),
+        stream_buffer_path=workspace.stream_buffer_path_for_schema(schema_name),
+    )
+
+
 def test_command() -> int:
     completed = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"], check=False)
     return int(completed.returncode)
@@ -208,6 +265,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_epub_parser = subparsers.add_parser("add-epub", help="copy an epub into input directory and register it in config")
     add_epub_parser.add_argument("epub_path", help="path to the epub file to add")
+
+    restore_parser = subparsers.add_parser("restore", help="restore output and progress from a saved checkpoint")
+    restore_parser.add_argument("--epub", required=True, help="epub path used to locate the workspace")
+    restore_parser.add_argument("--schema", required=True, help="schema path to restore")
+    checkpoint_group = restore_parser.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument("--checkpoint", help="checkpoint id such as ch0010")
+    checkpoint_group.add_argument("--latest", action="store_true", help="restore the latest checkpoint")
 
     subparsers.add_parser("run", help="run extraction tasks from config")
     subparsers.add_parser("test", help="run unit tests")
@@ -226,6 +290,14 @@ def main(argv: list[str] | None = None) -> int:
         return init_command(config_path, force=bool(args.force))
     if args.command == "add-epub":
         return add_epub_command(config_path, Path(args.epub_path))
+    if args.command == "restore":
+        return restore_command(
+            config_path,
+            epub_path=Path(args.epub),
+            schema_path=Path(args.schema),
+            checkpoint_id=getattr(args, "checkpoint", None),
+            latest=bool(getattr(args, "latest", False)),
+        )
     if args.command == "test":
         return test_command()
 

@@ -3,3 +3,5 @@ __pycache__
 workspace/*
 prompts/*
 schemas/*
+input/*
+/config.yaml
