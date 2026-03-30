@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +18,20 @@ from schema_loader import SchemaLoader
 from schema_validator import SchemaValidator
 from workspace_manager import WorkspaceManager
 from yaml_store import YamlStore
+
+
+@dataclass
+class TaskExecutionState:
+    """单个任务的执行状态，支持批次级步进执行。"""
+
+    task: TaskDefinition
+    chapters: list[Chapter]
+    schema_definition: SchemaDefinition
+    prompt_templates: list[PromptTemplate]
+    progress: dict[str, Any]
+    pending_batches: deque[ChapterBatch] = field(default_factory=deque)
+    is_completed: bool = False
+    is_failed: bool = False
 
 
 class TaskRunner:
@@ -63,7 +79,8 @@ class TaskRunner:
                 )
         return tasks
 
-    def run_task(self, task: TaskDefinition) -> dict[str, Any]:
+    def prepare_task_state(self, task: TaskDefinition) -> TaskExecutionState:
+        """初始化任务执行状态，用于后续批次级步进执行。"""
         self._log(task, f"task started epub={task.epub_path} schema={task.schema_path}")
         chapters = extract_epub(str(task.epub_path))
         schema_definition = self.schema_loader.load(task.schema_path)
@@ -84,30 +101,104 @@ class TaskRunner:
         remaining_chapters = chapters[start_index:]
         batches = self._build_initial_batches(task, remaining_chapters)
 
-        for batch in batches:
-            self._log(
-                task,
-                f"batch start range={batch.display_range} depth={batch.split_depth} count={batch.chapter_count} tokens={batch.token_estimate}",
-            )
-            batch_result = self._run_batch_tree(
-                task,
-                batch=batch,
-                total_chapters=len(chapters),
-                schema_definition=schema_definition,
-                prompt_templates=prompt_templates,
-                progress=progress,
-            )
-            progress = batch_result["progress"]
-            if progress.get("status") == "failed":
-                self._log(task, f"task failed last_error={self._last_error(progress)}")
-                return progress
+        return TaskExecutionState(
+            task=task,
+            chapters=chapters,
+            schema_definition=schema_definition,
+            prompt_templates=prompt_templates,
+            progress=progress,
+            pending_batches=deque(batches),
+        )
 
-        if progress.get("status") != "failed":
-            progress["status"] = "completed"
-            progress["batch_status"] = "completed"
-            self.progress_store.save(task.progress_path, progress)
-            self._log(task, "task completed")
-        return progress
+    def step_task(self, state: TaskExecutionState) -> dict[str, Any]:
+        """执行一个批次后返回，支持公平调度让出 worker。
+
+        返回值包含:
+        - progress: 当前进度
+        - is_completed: 任务是否已完成
+        - is_failed: 任务是否失败
+        """
+        if state.is_completed or state.is_failed:
+            return {
+                "progress": state.progress,
+                "is_completed": state.is_completed,
+                "is_failed": state.is_failed,
+            }
+
+        if not state.pending_batches:
+            # 没有待执行批次，标记完成
+            if state.progress.get("status") != "failed":
+                state.progress["status"] = "completed"
+                state.progress["batch_status"] = "completed"
+                self.progress_store.save(state.task.progress_path, state.progress)
+                self._log(state.task, "task completed")
+            state.is_completed = True
+            return {
+                "progress": state.progress,
+                "is_completed": True,
+                "is_failed": False,
+            }
+
+        batch = state.pending_batches.popleft()
+        self._log(
+            state.task,
+            f"batch start range={batch.display_range} depth={batch.split_depth} count={batch.chapter_count} tokens={batch.token_estimate}",
+        )
+
+        batch_result = self._run_batch_single(
+            state.task,
+            batch=batch,
+            total_chapters=len(state.chapters),
+            schema_definition=state.schema_definition,
+            prompt_templates=state.prompt_templates,
+            progress=state.progress,
+        )
+        state.progress = batch_result["progress"]
+
+        if batch_result.get("needs_split"):
+            # 批次失败需要拆分，将子批次加入队列尾部，让其他任务先执行
+            left_batch, right_batch = batch.split()
+            self._log(
+                state.task,
+                f"batch split parent={batch.batch_id} range={batch.display_range} -> left={left_batch.display_range} right={right_batch.display_range} reason={batch_result.get('split_reason', 'unknown')}",
+            )
+            state.pending_batches.append(left_batch)
+            state.pending_batches.append(right_batch)
+            return {
+                "progress": state.progress,
+                "is_completed": False,
+                "is_failed": False,
+            }
+
+        if state.progress.get("status") == "failed":
+            state.is_failed = True
+            self._log(state.task, f"task failed last_error={self._last_error(state.progress)}")
+            return {
+                "progress": state.progress,
+                "is_completed": False,
+                "is_failed": True,
+            }
+
+        return {
+            "progress": state.progress,
+            "is_completed": False,
+            "is_failed": False,
+        }
+
+    def run_task(self, task: TaskDefinition) -> dict[str, Any]:
+        """执行任务直到完成，保持向后兼容。
+
+        注意：此方法会一次性执行完整个任务。如需公平调度，
+        请使用 prepare_task_state 和 step_task 方法。
+        """
+        state = self.prepare_task_state(task)
+
+        while not state.is_completed and not state.is_failed:
+            result = self.step_task(state)
+            if result.get("is_completed") or result.get("is_failed"):
+                break
+
+        return state.progress
 
     def _build_initial_batches(self, task: TaskDefinition, chapters: list[Chapter]) -> list[ChapterBatch]:
         if not chapters:
@@ -166,62 +257,6 @@ class TaskRunner:
             batches.append(ChapterBatch.from_chapters(pending))
 
         return batches
-
-
-    def _run_batch_tree(
-        self,
-        task: TaskDefinition,
-        *,
-        batch: ChapterBatch,
-        total_chapters: int,
-        schema_definition: SchemaDefinition,
-        prompt_templates: list[PromptTemplate],
-        progress: dict[str, Any],
-    ) -> dict[str, Any]:
-        batch_result = self._run_batch(
-            task,
-            batch=batch,
-            total_chapters=total_chapters,
-            schema_definition=schema_definition,
-            prompt_templates=prompt_templates,
-            progress=progress,
-        )
-        progress = batch_result["progress"]
-        if progress.get("status") != "failed":
-            return {"progress": progress}
-
-        if not self._should_split_batch(batch):
-            return {"progress": progress}
-
-        split_reason = self._last_error(progress) or "batch retries exhausted"
-        progress = self.progress_store.mark_batch_split(progress, batch=batch, reason=split_reason)
-        self.progress_store.save(task.progress_path, progress)
-        left_batch, right_batch = batch.split()
-        self._log(
-            task,
-            f"batch split parent={batch.batch_id} range={batch.display_range} -> left={left_batch.display_range} right={right_batch.display_range} reason={split_reason}",
-        )
-
-        left_result = self._run_batch_tree(
-            task,
-            batch=left_batch,
-            total_chapters=total_chapters,
-            schema_definition=schema_definition,
-            prompt_templates=prompt_templates,
-            progress=progress,
-        )
-        progress = left_result["progress"]
-        if progress.get("status") == "failed":
-            return {"progress": progress}
-
-        return self._run_batch_tree(
-            task,
-            batch=right_batch,
-            total_chapters=total_chapters,
-            schema_definition=schema_definition,
-            prompt_templates=prompt_templates,
-            progress=progress,
-        )
 
     def _run_batch(
         self,
@@ -379,6 +414,47 @@ class TaskRunner:
         self._log(task, f"batch failed range={batch.display_range} last_error={self._last_error(progress)}")
         self._emit_progress(task, schema_definition, progress, "failed")
         return {"progress": progress}
+
+    def _run_batch_single(
+        self,
+        task: TaskDefinition,
+        *,
+        batch: ChapterBatch,
+        total_chapters: int,
+        schema_definition: SchemaDefinition,
+        prompt_templates: list[PromptTemplate],
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        """执行单个批次，失败时返回拆分标记而不是递归执行。
+
+        与 _run_batch 不同，此方法在批次失败且可拆分时返回 needs_split=True，
+        让调用方决定如何处理拆分后的子批次，从而实现公平调度。
+        """
+        batch_result = self._run_batch(
+            task,
+            batch=batch,
+            total_chapters=total_chapters,
+            schema_definition=schema_definition,
+            prompt_templates=prompt_templates,
+            progress=progress,
+        )
+        progress = batch_result["progress"]
+
+        if progress.get("status") != "failed":
+            return {"progress": progress, "needs_split": False}
+
+        # 检查是否应该拆分
+        if self._should_split_batch(batch):
+            split_reason = self._last_error(progress) or "batch retries exhausted"
+            progress = self.progress_store.mark_batch_split(progress, batch=batch, reason=split_reason)
+            self.progress_store.save(task.progress_path, progress)
+            return {
+                "progress": progress,
+                "needs_split": True,
+                "split_reason": split_reason,
+            }
+
+        return {"progress": progress, "needs_split": False}
 
     def _should_split_batch(self, batch: ChapterBatch) -> bool:
         if batch.chapter_count <= 1:

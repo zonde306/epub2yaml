@@ -4,13 +4,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib import error
 
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from app import restore_command  # noqa: E402
+from app import restore_command, run_command  # noqa: E402
 from checkpoint_store import CheckpointStore  # noqa: E402
 from llm_client import (  # noqa: E402
     ApiStreamError,
@@ -27,7 +28,7 @@ from progress_store import ProgressStore  # noqa: E402
 from prompt_builder import PromptBuilder  # noqa: E402
 from schema_loader import SchemaLoader  # noqa: E402
 from schema_validator import SchemaValidator  # noqa: E402
-from task_runner import TaskRunner  # noqa: E402
+from task_runner import TaskExecutionState, TaskRunner  # noqa: E402
 from workspace_manager import WorkspaceManager, slugify_epub_name  # noqa: E402
 from yaml_store import YamlStore  # noqa: E402
 
@@ -586,6 +587,82 @@ class TaskRunnerTests(unittest.TestCase):
             self.assertEqual(yaml_text, "worldinfo:\n  黑风寨:\n    content: 新内容\n")
             self.assertEqual(stream_buffer_path.read_text(encoding="utf-8"), yaml_text)
             self.assertEqual(response_debug_path.read_text(encoding="utf-8"), yaml_text)
+
+    def test_step_task_runs_single_batch_and_yields(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+        )
+        runner = TaskRunner(config)
+        workspace = WorkspaceManager(Path("workspace")).ensure_workspace(Path("input/book.epub"))
+        task = TaskDefinition(
+            epub_path=Path("input/book.epub"),
+            workspace=workspace,
+            schema_path=Path("schemas/world.yaml"),
+            prompt_template_paths=[],
+            output_path=workspace.output_path_for_schema("world"),
+            progress_path=workspace.progress_path_for_schema("world"),
+            stream_buffer_path=workspace.stream_buffer_path_for_schema("world"),
+        )
+        batch1 = ChapterBatch.from_chapters([Chapter(1, "ch0001", "第一章", "A", "a.xhtml", 10)])
+        batch2 = ChapterBatch.from_chapters([Chapter(2, "ch0002", "第二章", "B", "b.xhtml", 10)])
+        state = TaskExecutionState(
+            task=task,
+            chapters=[],
+            schema_definition=SchemaLoader().load(Path("schemas/world.yaml")),
+            prompt_templates=[],
+            progress={"status": "running"},
+            pending_batches=__import__("collections").deque([batch1, batch2]),
+        )
+
+        with patch.object(runner, "_run_batch_single", side_effect=[{"progress": {"status": "running"}, "needs_split": False}]) as run_batch_single:
+            result = runner.step_task(state)
+
+        self.assertFalse(result["is_completed"])
+        self.assertFalse(result["is_failed"])
+        self.assertEqual(len(state.pending_batches), 1)
+        run_batch_single.assert_called_once()
+
+    def test_run_command_rotates_epubs_in_parallel_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            config_path = root / "config.yaml"
+            raw_config = {
+                "input_epubs": ["input/book-a.epub", "input/book-b.epub"],
+                "schema_paths": ["schemas/world.yaml", "schemas/characters.yaml"],
+                "prompt_templates": [],
+                "workspace_root": str(root / "workspace").replace("\\", "/"),
+                "concurrency": {"enable_parallel_tasks": True, "max_workers": 2},
+            }
+            config_path.write_text(yaml.safe_dump(raw_config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+
+            dispatch_log: list[str] = []
+
+            def fake_prepare(task: TaskDefinition):
+                dispatch_log.append(f"prepare:{task.workspace.epub_name}:{task.schema_path.stem}")
+                return type(
+                    "StubState",
+                    (),
+                    {
+                        "task": task,
+                        "pending_batches": [],
+                        "is_completed": False,
+                        "is_failed": False,
+                    },
+                )()
+
+            def fake_step(state):
+                return {"progress": {"status": "completed"}, "is_completed": True, "is_failed": False}
+
+            with patch.object(TaskRunner, "prepare_task_state", side_effect=fake_prepare), patch.object(TaskRunner, "step_task", side_effect=fake_step):
+                exit_code = run_command(config_path)
+
+            self.assertEqual(exit_code, 0)
+            self.assertGreaterEqual(len(dispatch_log), 4)
+            self.assertEqual(dispatch_log[0], "prepare:book-a:world")
+            self.assertEqual(dispatch_log[1], "prepare:book-b:world")
 
 
 class CheckpointStoreTests(unittest.TestCase):

@@ -4,14 +4,14 @@ import argparse
 import shutil
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import defaultdict, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from checkpoint_store import CheckpointStore
-from extractor_graph import ExtractorGraph
 from models import AppConfig, BatchingConfig, TaskDefinition
 from progress_store import ProgressStore
 from task_runner import TaskRunner
@@ -175,7 +175,6 @@ def add_epub_command(config_path: Path, epub_source: Path) -> int:
 def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     config = load_config(config_path)
     runner = TaskRunner(config)
-    graph = ExtractorGraph(runner)
     tasks = runner.build_tasks()
 
     if not tasks:
@@ -185,13 +184,59 @@ def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
     results: list[dict[str, Any]] = []
 
     if config.enable_parallel_tasks and config.max_workers > 1:
+        epub_buckets: dict[str, deque[Any]] = defaultdict(deque)
+        for task in tasks:
+            epub_key = task.workspace.epub_name
+            epub_buckets[epub_key].append(task)
+
+        epub_order = list(epub_buckets.keys())
+        epub_cursor = 0
+
+        def pick_next_item() -> Any | None:
+            nonlocal epub_cursor
+            if not epub_order:
+                return None
+            checked = 0
+            while checked < len(epub_order):
+                epub_key = epub_order[epub_cursor]
+                bucket = epub_buckets[epub_key]
+                if bucket:
+                    item = bucket.popleft()
+                    epub_cursor = (epub_cursor + 1) % len(epub_order)
+                    return item
+                epub_cursor = (epub_cursor + 1) % len(epub_order)
+                checked += 1
+            return None
+
+        def run_one_step(item: Any) -> tuple[Any, dict[str, Any]]:
+            state = item if hasattr(item, "pending_batches") else runner.prepare_task_state(item)
+            step_result = runner.step_task(state)
+            return state, step_result
+
         with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            future_map = {executor.submit(graph.run, task): task for task in tasks}
-            for future in as_completed(future_map):
-                results.append(future.result())
+            future_map: dict[Any, bool] = {}
+
+            def fill_workers() -> None:
+                while len(future_map) < config.max_workers:
+                    item = pick_next_item()
+                    if item is None:
+                        break
+                    future_map[executor.submit(run_one_step, item)] = True
+
+            fill_workers()
+            while future_map:
+                done, _ = wait(list(future_map.keys()), return_when=FIRST_COMPLETED)
+                for future in done:
+                    future_map.pop(future)
+                    state, step_result = future.result()
+                    if step_result.get("is_completed") or step_result.get("is_failed"):
+                        results.append(step_result["progress"])
+                    else:
+                        epub_buckets[state.task.workspace.epub_name].append(state)
+                fill_workers()
     else:
         for task in tasks:
-            results.append(graph.run(task))
+            results.append(runner.run_task(task))
 
     failed_count = sum(1 for result in results if result.get("status") == "failed")
     completed_count = sum(1 for result in results if result.get("status") == "completed")
