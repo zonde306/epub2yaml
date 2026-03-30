@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
-
+import re
 import yaml
 
 from models import SchemaDefinition, ValidationIssue, ValidationResult
@@ -12,6 +12,9 @@ _REMOVE = object()
 
 class SchemaValidator:
     def parse_yaml_text(self, yaml_text: str) -> tuple[dict[str, Any] | None, ValidationResult]:
+        if match := re.search(r"```yaml\s*([\s\S]*?)\s*```$", yaml_text, re.MULTILINE|re.IGNORECASE):
+            yaml_text = match.group(1)
+
         try:
             data = yaml.safe_load(yaml_text)
         except yaml.YAMLError as exc:
