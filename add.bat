@@ -1,0 +1,1 @@
+python src/app.py add-epub %1

@@ -12,7 +12,7 @@ _REMOVE = object()
 
 class SchemaValidator:
     def parse_yaml_text(self, yaml_text: str) -> tuple[dict[str, Any] | None, ValidationResult]:
-        if match := re.search(r"```(?:yaml)?\s*([\s\S]*?)\s*```", yaml_text, re.MULTILINE|re.IGNORECASE):
+        if match := re.search(r"```(?:yaml)?\s*([\s\S]*?)\s*```", yaml_text, re.IGNORECASE):
             yaml_text = match.group(1)
 
         try:

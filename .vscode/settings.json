@@ -1,3 +1,4 @@
 {
-    "commentTranslate.source": "Bing"
+    "commentTranslate.source": "Bing",
+    "python-envs.defaultEnvManager": "ms-python.python:system"
 }
