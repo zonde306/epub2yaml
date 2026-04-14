@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import shutil
 import subprocess
 import sys
 from collections import defaultdict, deque
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +75,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             enable_checkpoint=bool(batching.get("enable_checkpoint", False)),
             checkpoint_every_n_chapters=int(batching.get("checkpoint_every_n_chapters", 10)),
         ),
+        blacklist_keywords=list(raw.get("blacklist_keywords", [])),
     )
 
 
@@ -134,6 +135,7 @@ def default_raw_config() -> dict[str, Any]:
             "enable_checkpoint": False,
             "checkpoint_every_n_chapters": 10,
         },
+        "blacklist_keywords": [],
     }
 
 
@@ -172,7 +174,8 @@ def add_epub_command(config_path: Path, epub_source: Path) -> int:
     return 0
 
 
-def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+async def run_command_async(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+    """异步执行任务的主函数。"""
     config = load_config(config_path)
     runner = TaskRunner(config)
     tasks = runner.build_tasks()
@@ -191,6 +194,7 @@ def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
 
         epub_order = list(epub_buckets.keys())
         epub_cursor = 0
+        active_tasks: dict[asyncio.Task[Any], bool] = {}
 
         def pick_next_item() -> Any | None:
             nonlocal epub_cursor
@@ -208,40 +212,42 @@ def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
                 checked += 1
             return None
 
-        def run_one_step(item: Any) -> tuple[Any, dict[str, Any]]:
+        async def run_one_step(item: Any) -> tuple[Any, dict[str, Any]]:
             state = item if hasattr(item, "pending_batches") else runner.prepare_task_state(item)
-            step_result = runner.step_task(state)
+            step_result = await runner.step_task(state)
             return state, step_result
 
-        with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
-            future_map: dict[Any, bool] = {}
+        def fill_workers() -> None:
+            while len(active_tasks) < config.max_workers:
+                item = pick_next_item()
+                if item is None:
+                    break
+                active_tasks[asyncio.create_task(run_one_step(item))] = True
 
-            def fill_workers() -> None:
-                while len(future_map) < config.max_workers:
-                    item = pick_next_item()
-                    if item is None:
-                        break
-                    future_map[executor.submit(run_one_step, item)] = True
-
+        fill_workers()
+        while active_tasks:
+            done, _ = await asyncio.wait(list(active_tasks.keys()), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                active_tasks.pop(task)
+                state, step_result = task.result()
+                if step_result.get("is_completed") or step_result.get("is_failed"):
+                    results.append(step_result["progress"])
+                else:
+                    epub_buckets[state.task.workspace.epub_name].append(state)
             fill_workers()
-            while future_map:
-                done, _ = wait(list(future_map.keys()), return_when=FIRST_COMPLETED)
-                for future in done:
-                    future_map.pop(future)
-                    state, step_result = future.result()
-                    if step_result.get("is_completed") or step_result.get("is_failed"):
-                        results.append(step_result["progress"])
-                    else:
-                        epub_buckets[state.task.workspace.epub_name].append(state)
-                fill_workers()
     else:
         for task in tasks:
-            results.append(runner.run_task(task))
+            results.append(await runner.run_task(task))
 
     failed_count = sum(1 for result in results if result.get("status") == "failed")
     completed_count = sum(1 for result in results if result.get("status") == "completed")
     print(f"Finished tasks: completed={completed_count} failed={failed_count} total={len(results)}")
     return 0 if failed_count == 0 else 2
+
+
+def run_command(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
+    """同步包装器，用于命令行入口。"""
+    return asyncio.run(run_command_async(config_path))
 
 
 def restore_command(

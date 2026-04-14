@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import AsyncIterable
 from typing import Any
 
 import httpx
@@ -28,7 +28,7 @@ class ApiStreamError(RuntimeError):
 
 
 class EchoStreamModelClient(StreamModelClient):
-    def stream_yaml(self, prompt: str) -> Iterable[str]:
+    async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
         fallback_root = os.getenv("EPUB2DICT_FAKE_ROOT", "actors")
         root_key = detect_root_key(prompt) or fallback_root
         content = f"{root_key}: []\n"
@@ -50,7 +50,7 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
         self.model_name = model_name
         self.timeout_seconds = timeout_seconds
 
-    def stream_yaml(self, prompt: str) -> Iterable[str]:
+    async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
         if not self.api_key:
             raise ApiStreamError("api_key is required for real API streaming")
         if not self.model_name:
@@ -67,10 +67,10 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
         timeout = httpx.Timeout(self.timeout_seconds)
 
         try:
-            with httpx.Client(timeout=timeout) as client:
-                with client.stream("POST", url, json=payload, headers=headers) as response:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream("POST", url, json=payload, headers=headers) as response:
                     response.raise_for_status()
-                    for line in response.iter_lines():
+                    async for line in response.aiter_lines():
                         if not line:
                             continue
                         if not line.startswith("data:"):

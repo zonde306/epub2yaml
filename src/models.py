@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import AsyncIterable
 from dataclasses import dataclass, field
 from pathlib import Path
 import re
@@ -287,6 +287,7 @@ class AppConfig:
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
     batching: BatchingConfig = field(default_factory=BatchingConfig)
+    blacklist_keywords: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -319,5 +320,5 @@ class TaskRuntimeState:
 
 
 class StreamModelClient(Protocol):
-    def stream_yaml(self, prompt: str) -> Iterable[str]:
+    async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
         ...

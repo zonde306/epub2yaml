@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import time
+import asyncio
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -110,7 +110,7 @@ class TaskRunner:
             pending_batches=deque(batches),
         )
 
-    def step_task(self, state: TaskExecutionState) -> dict[str, Any]:
+    async def step_task(self, state: TaskExecutionState) -> dict[str, Any]:
         """执行一个批次后返回，支持公平调度让出 worker。
 
         返回值包含:
@@ -145,7 +145,7 @@ class TaskRunner:
             f"batch start range={batch.display_range} depth={batch.split_depth} count={batch.chapter_count} tokens={batch.token_estimate}",
         )
 
-        batch_result = self._run_batch_single(
+        batch_result = await self._run_batch_single(
             state.task,
             batch=batch,
             total_chapters=len(state.chapters),
@@ -185,7 +185,7 @@ class TaskRunner:
             "is_failed": False,
         }
 
-    def run_task(self, task: TaskDefinition) -> dict[str, Any]:
+    async def run_task(self, task: TaskDefinition) -> dict[str, Any]:
         """执行任务直到完成，保持向后兼容。
 
         注意：此方法会一次性执行完整个任务。如需公平调度，
@@ -194,7 +194,7 @@ class TaskRunner:
         state = self.prepare_task_state(task)
 
         while not state.is_completed and not state.is_failed:
-            result = self.step_task(state)
+            result = await self.step_task(state)
             if result.get("is_completed") or result.get("is_failed"):
                 break
 
@@ -258,7 +258,7 @@ class TaskRunner:
 
         return batches
 
-    def _run_batch(
+    async def _run_batch(
         self,
         task: TaskDefinition,
         *,
@@ -324,7 +324,7 @@ class TaskRunner:
                 )
 
                 try:
-                    yaml_text, chunk_count = self._collect_stream(
+                    yaml_text, chunk_count = await self._collect_stream(
                         task.stream_buffer_path,
                         response_debug_path,
                         prompt,
@@ -340,6 +340,22 @@ class TaskRunner:
 
                 self._log(task, f"stream completed range={batch.display_range} chunk_count={chunk_count}")
                 progress = self.progress_store.update_stream(progress, receive_status="completed", chunk_count=chunk_count)
+
+                # 检查黑名单关键字
+                blacklist_error = self._check_blacklist(yaml_text)
+                if blacklist_error:
+                    last_error = blacklist_error
+                    self._log(task, f"blacklist check failed range={batch.display_range} error={last_error}")
+                    progress = self.progress_store.update_validation(
+                        progress,
+                        result="failed",
+                        error_count=1,
+                        last_error=last_error,
+                    )
+                    self.progress_store.save(task.progress_path, progress)
+                    self._emit_progress(task, schema_definition, progress, template.name)
+                    continue
+
                 parsed_yaml, parse_result = self.schema_validator.parse_yaml_text(yaml_text)
                 if not parse_result.ok or parsed_yaml is None:
                     last_error = parse_result.summary()
@@ -402,7 +418,7 @@ class TaskRunner:
             batch_retry += 1
             if batch_retry < self.config.retry_count and self.config.retry_backoff_seconds > 0:
                 self._log(task, f"batch retry sleeping seconds={self.config.retry_backoff_seconds}")
-                time.sleep(self.config.retry_backoff_seconds)
+                await asyncio.sleep(self.config.retry_backoff_seconds)
 
         progress = self.progress_store.mark_failed(
             progress,
@@ -415,7 +431,7 @@ class TaskRunner:
         self._emit_progress(task, schema_definition, progress, "failed")
         return {"progress": progress}
 
-    def _run_batch_single(
+    async def _run_batch_single(
         self,
         task: TaskDefinition,
         *,
@@ -430,7 +446,7 @@ class TaskRunner:
         与 _run_batch 不同，此方法在批次失败且可拆分时返回 needs_split=True，
         让调用方决定如何处理拆分后的子批次，从而实现公平调度。
         """
-        batch_result = self._run_batch(
+        batch_result = await self._run_batch(
             task,
             batch=batch,
             total_chapters=total_chapters,
@@ -467,7 +483,7 @@ class TaskRunner:
             return False
         return True
 
-    def _collect_stream(self, stream_buffer_path: Path, response_debug_path: Path, prompt: str) -> tuple[str, int]:
+    async def _collect_stream(self, stream_buffer_path: Path, response_debug_path: Path, prompt: str) -> tuple[str, int]:
         chunks: list[str] = []
         chunk_count = 0
         stream_buffer_path.parent.mkdir(parents=True, exist_ok=True)
@@ -476,7 +492,7 @@ class TaskRunner:
             stream_buffer_path.open("w", encoding="utf-8") as stream_handle,
             response_debug_path.open("w", encoding="utf-8") as debug_handle,
         ):
-            for chunk in self.model_client.stream_yaml(prompt):
+            async for chunk in self.model_client.stream_yaml(prompt):
                 stream_handle.write(chunk)
                 stream_handle.flush()
                 debug_handle.write(chunk)
@@ -612,3 +628,12 @@ class TaskRunner:
         if isinstance(last_error, str):
             return last_error.strip()
         return str(last_error)
+
+    def _check_blacklist(self, text: str) -> str:
+        """检查文本是否包含黑名单关键字，返回错误信息；如果通过则返回空字符串。"""
+        if not self.config.blacklist_keywords:
+            return ""
+        for keyword in self.config.blacklist_keywords:
+            if keyword and keyword in text:
+                return f"输出包含黑名单关键字: {keyword}"
+        return ""

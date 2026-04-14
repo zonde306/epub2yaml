@@ -64,6 +64,7 @@ class SchemaValidator:
         return node
 
     def validate_increment(self, data: dict[str, Any], schema_definition: SchemaDefinition) -> ValidationResult:
+        # TODO: JSON Schema validator
         return ValidationResult(ok=True, errors=[])
 
     def _extract_item_skeleton(self, schema_definition: SchemaDefinition) -> Any:

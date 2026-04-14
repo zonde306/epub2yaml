@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib import error
 
 import yaml
@@ -559,7 +560,7 @@ class TaskRunnerTests(unittest.TestCase):
 
     def test_collect_stream_writes_stream_and_debug_response_files(self) -> None:
         class StubStreamModelClient:
-            def stream_yaml(self, prompt: str):
+            async def stream_yaml(self, prompt: str):
                 self.last_prompt = prompt
                 yield "worldinfo:\n"
                 yield "  黑风寨:\n"
@@ -580,7 +581,7 @@ class TaskRunnerTests(unittest.TestCase):
             stream_buffer_path = workspace_root / "epub" / "temp" / "world.stream.txt"
             response_debug_path = workspace_root / "epub" / "logs" / "debug" / "world.ch0001-ch0001.d0.r01.base.response.yaml"
 
-            yaml_text, chunk_count = runner._collect_stream(stream_buffer_path, response_debug_path, "hello prompt")
+            yaml_text, chunk_count = asyncio.run(runner._collect_stream(stream_buffer_path, response_debug_path, "hello prompt"))
 
             self.assertEqual(client.last_prompt, "hello prompt")
             self.assertEqual(chunk_count, 3)
@@ -617,8 +618,11 @@ class TaskRunnerTests(unittest.TestCase):
             pending_batches=__import__("collections").deque([batch1, batch2]),
         )
 
-        with patch.object(runner, "_run_batch_single", side_effect=[{"progress": {"status": "running"}, "needs_split": False}]) as run_batch_single:
-            result = runner.step_task(state)
+        async def mock_run_batch_single(*args, **kwargs):
+            return {"progress": {"status": "running"}, "needs_split": False}
+
+        with patch.object(runner, "_run_batch_single", side_effect=mock_run_batch_single) as run_batch_single:
+            result = asyncio.run(runner.step_task(state))
 
         self.assertFalse(result["is_completed"])
         self.assertFalse(result["is_failed"])
@@ -653,7 +657,7 @@ class TaskRunnerTests(unittest.TestCase):
                     },
                 )()
 
-            def fake_step(state):
+            async def fake_step(state):
                 return {"progress": {"status": "completed"}, "is_completed": True, "is_failed": False}
 
             with patch.object(TaskRunner, "prepare_task_state", side_effect=fake_prepare), patch.object(TaskRunner, "step_task", side_effect=fake_step):
@@ -827,7 +831,13 @@ class LlmClientTests(unittest.TestCase):
             model_name="gpt-4.1",
         )
         with self.assertRaises(ApiStreamError):
-            list(client.stream_yaml("hello"))
+            asyncio.run(self._collect_stream(client, "hello"))
+
+    async def _collect_stream(self, client, prompt: str) -> list[str]:
+        result = []
+        async for chunk in client.stream_yaml(prompt):
+            result.append(chunk)
+        return result
 
     def test_read_http_error(self) -> None:
         exc = error.HTTPError(
