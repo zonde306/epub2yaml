@@ -247,6 +247,13 @@ class MergeStats:
 
 
 @dataclass(slots=True)
+class MergeConfig:
+    """智能数组合并配置"""
+    similarity_threshold: float = 0.6
+    field_weights: dict[str, float] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class RetryConfig:
     max_attempts: int = 3
     backoff_seconds: int = 3
@@ -288,6 +295,7 @@ class AppConfig:
     api_key: str = ""
     batching: BatchingConfig = field(default_factory=BatchingConfig)
     blacklist_keywords: list[str] = field(default_factory=list)
+    merge: MergeConfig = field(default_factory=MergeConfig)
 
 
 @dataclass(slots=True)

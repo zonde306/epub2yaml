@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 
 from checkpoint_store import CheckpointStore
-from models import AppConfig, BatchingConfig, TaskDefinition
+from models import AppConfig, BatchingConfig, MergeConfig, TaskDefinition
 from progress_store import ProgressStore
 from task_runner import TaskRunner
 from workspace_manager import WorkspaceManager
@@ -47,6 +47,7 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     runtime = raw.get("runtime", {})
     progress = raw.get("progress", {})
     batching = raw.get("batching", {})
+    merge = raw.get("merge", {})
 
     return AppConfig(
         input_epubs=input_epubs,
@@ -76,6 +77,10 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
             checkpoint_every_n_chapters=int(batching.get("checkpoint_every_n_chapters", 10)),
         ),
         blacklist_keywords=list(raw.get("blacklist_keywords", [])),
+        merge=MergeConfig(
+            similarity_threshold=float(merge.get("similarity_threshold", 0.6)),
+            field_weights=dict(merge.get("field_weights", {})),
+        ),
     )
 
 
@@ -136,6 +141,10 @@ def default_raw_config() -> dict[str, Any]:
             "checkpoint_every_n_chapters": 10,
         },
         "blacklist_keywords": [],
+        "merge": {
+            "similarity_threshold": 0.6,
+            "field_weights": {},
+        },
     }
 
 

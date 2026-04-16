@@ -55,7 +55,7 @@ class TaskRunner:
         self.prompt_loader = prompt_loader or PromptLoader()
         self.prompt_builder = prompt_builder or PromptBuilder()
         self.schema_validator = schema_validator or SchemaValidator()
-        self.yaml_store = yaml_store or YamlStore()
+        self.yaml_store = yaml_store or YamlStore(config.merge)
         self.progress_store = progress_store or ProgressStore()
         self.workspace_manager = workspace_manager or WorkspaceManager(config.workspace_root)
         self.checkpoint_store = checkpoint_store or CheckpointStore()

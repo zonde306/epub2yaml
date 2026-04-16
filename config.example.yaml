@@ -39,3 +39,14 @@ blacklist_keywords: []
 #   - "抱歉"
 #   - "我无法"
 #   - "作为AI"
+
+# 智能数组合并配置
+merge:
+  similarity_threshold: 0.6  # 相似度阈值，范围0.0-1.0
+  # 字段权重配置：key为字段路径（支持嵌套路径用点号分隔），value为权重（默认为1.0）
+  # 权重越高，该字段对整体相似度的影响越大
+  field_weights: {}
+  # field_weights:
+  #   name: 2.0           # name字段权重为2.0
+  #   title: 1.5          # title字段权重为1.5
+  #   person.name: 3.0    # 嵌套字段权重

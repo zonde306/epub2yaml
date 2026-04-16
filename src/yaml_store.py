@@ -5,7 +5,8 @@ from typing import Any
 
 import yaml
 
-from models import MergeStats, SchemaDefinition
+from models import MergeConfig, MergeStats, SchemaDefinition
+from smart_array_merger import SmartArrayMerger
 
 
 class IndentedSafeDumper(yaml.SafeDumper):
@@ -14,6 +15,10 @@ class IndentedSafeDumper(yaml.SafeDumper):
 
 
 class YamlStore:
+    def __init__(self, merge_config: MergeConfig | None = None):
+        self._merge_config = merge_config or MergeConfig()
+        self._merger = SmartArrayMerger(self._merge_config)
+    
     def load_yaml(self, path: Path, default: dict[str, Any] | None = None) -> dict[str, Any]:
         if not path.exists():
             return default.copy() if default is not None else {}
@@ -88,9 +93,11 @@ class YamlStore:
                     merged[key] = self._clone_node(value)
             return merged
 
-        if isinstance(incoming, list):
-            return [self._clone_node(item) for item in incoming]
+        # 数组合并：使用智能合并
+        if isinstance(current, list) and isinstance(incoming, list):
+            return self._merger.merge_arrays(current, incoming)
 
+        # 其他类型：直接替换
         return self._clone_node(incoming)
 
     def _clone_node(self, node: Any) -> Any:
