@@ -122,6 +122,46 @@ class SchemaValidatorTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.errors)
 
+    def test_parse_yaml_text_strips_plain_markdown_code_block(self) -> None:
+        yaml_text = "```\nactors:\n  - name: 张三\n```"
+        data, result = self.validator.parse_yaml_text(yaml_text)
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(data)
+        self.assertIn("actors", data)
+
+    def test_parse_yaml_text_strips_yaml_markdown_code_block(self) -> None:
+        yaml_text = "```yaml\nactors:\n  - name: 张三\n```"
+        data, result = self.validator.parse_yaml_text(yaml_text)
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(data)
+        self.assertIn("actors", data)
+
+    def test_parse_yaml_text_strips_yaml_markdown_code_block_uppercase(self) -> None:
+        yaml_text = "```YAML\nactors:\n  - name: 张三\n```"
+        data, result = self.validator.parse_yaml_text(yaml_text)
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(data)
+        self.assertIn("actors", data)
+
+    def test_parse_yaml_text_handles_missing_closing_backticks(self) -> None:
+        yaml_text = "```yaml\nactors:\n  - name: 张三"
+        data, result = self.validator.parse_yaml_text(yaml_text)
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(data)
+        self.assertIn("actors", data)
+
+    def test_parse_yaml_text_handles_plain_yaml_without_code_block(self) -> None:
+        yaml_text = "actors:\n  - name: 张三"
+        data, result = self.validator.parse_yaml_text(yaml_text)
+
+        self.assertTrue(result.ok)
+        self.assertIsNotNone(data)
+        self.assertIn("actors", data)
+
     def test_sanitize_increment_data_removes_empty_values_and_trims_strings(self) -> None:
         payload = {
             "worldinfo": {

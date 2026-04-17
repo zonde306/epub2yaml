@@ -12,8 +12,7 @@ _REMOVE = object()
 
 class SchemaValidator:
     def parse_yaml_text(self, yaml_text: str) -> tuple[dict[str, Any] | None, ValidationResult]:
-        if match := re.search(r"```(?:yaml)?\s*([\s\S]*?)\s*```", yaml_text, re.IGNORECASE):
-            yaml_text = match.group(1)
+        yaml_text = self._strip_markdown_code_block(yaml_text)
 
         try:
             data = yaml.safe_load(yaml_text)
@@ -114,6 +113,39 @@ class SchemaValidator:
             normalized = key.strip()
             return normalized if normalized else _REMOVE
         return key
+
+    def _strip_markdown_code_block(self, text: str) -> str:
+        """移除 markdown 代码块标记，支持多种格式。
+
+        支持的格式：
+        - ```\\n内容\\n```
+        - ```yaml\\n内容\\n```
+        - ```YAML\\n内容\\n```
+        - 以及其他语言标记
+        """
+        text = text.strip()
+
+        # 检查是否以 ``` 开头
+        if not text.startswith("```"):
+            return text
+
+        # 找到第一个换行符，分离语言标记和内容
+        first_newline = text.find("\n")
+        if first_newline == -1:
+            # 没有换行符，不是有效的代码块
+            return text
+
+        # 找到结束的 ```
+        # 从文本末尾开始查找，支持内容中可能包含 ``` 的情况
+        last_backticks = text.rfind("```")
+        if last_backticks <= first_newline:
+            # 没有找到结束标记，或者结束标记在开始标记之前
+            # 尝试移除开头的 ``` 和语言标记
+            return text[first_newline + 1 :].rstrip()
+
+        # 提取内容部分（去掉开头的 ```xxx 和结尾的 ```）
+        content = text[first_newline + 1 : last_backticks]
+        return content.strip()
 
     def _is_missing_entry_key(self, value: Any) -> bool:
         if value is None:
