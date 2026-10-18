@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import AsyncIterable, AsyncIterator
+from collections.abc import AsyncIterable, AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -21,6 +21,10 @@ HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 CLOUDFLARE_ERROR_PATTERN = re.compile(r"Error\s*(\d{3,4})", re.IGNORECASE)
 WHITESPACE_PATTERN = re.compile(r"\s+")
 DEFAULT_TIMEOUT_SECONDS = 300
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; "
+    ".NET CLR 3.5.30729; .NET CLR 3.0.30729; .NET4.0C; .NET4.0E; rv:11.0) like Gecko"
+)
 MAX_ERROR_TEXT_LENGTH = 240
 
 
@@ -53,18 +57,24 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
         self,
         *,
         base_url: str,
-        api_key: str,
-        model_name: str,
+        api_key: str = "",
+        model_name: str = "",
         timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
+        extra_body: Mapping[str, Any] | None = None,
+        extra_headers: Mapping[str, Any] | None = None,
     ) -> None:
         self.base_url = normalize_base_url(base_url)
         self.api_key = api_key
         self.model_name = model_name
         self.timeout_seconds = timeout_seconds
+        # 自定义请求体/请求头：用于适配各家 API 的额外参数要求
+        # （如 ``thinking``、``top_k``、``search``、``X-Api-Version`` 等）。
+        self.extra_body: dict[str, Any] = dict(extra_body or {})
+        self.extra_headers: dict[str, Any] = dict(extra_headers or {})
 
     async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
-        self._require_credentials()
-        payload = build_chat_completions_payload(self.model_name, prompt)
+        self._require_request_params()
+        payload = build_chat_completions_payload(self.model_name, prompt, extra_body=self.extra_body)
         async for chunk in self._iter_stream_chunks(payload):
             text = extract_stream_delta_text(chunk)
             if text:
@@ -79,8 +89,10 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
 
         工具调用参数在流中按片段到达，需按 index 累积后才能解析。
         """
-        self._require_credentials()
-        payload = build_tool_completion_payload(self.model_name, messages, tools)
+        self._require_request_params()
+        payload = build_tool_completion_payload(
+            self.model_name, messages, tools, extra_body=self.extra_body
+        )
         accumulator: dict[int, ToolCallAccumulator] = {}
         content_parts: list[str] = []
         usage: dict[str, Any] = {}
@@ -108,21 +120,16 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
             finish_reason=finish_reason,
         )
 
-    def _require_credentials(self) -> None:
-        if not self.api_key:
-            raise ApiStreamError("api_key is required for real API streaming")
-        if not self.model_name:
-            raise ApiStreamError("model_name is required for real API streaming")
+    def _require_request_params(self) -> None:
+        # 注意：api_key 不是必填项。不少自建/Ollama/vLLM/LM Studio 端点
+        # 完全不需要鉴权，头部则由 extra_headers 自行决定。
+        if not self.model_name and "model" not in self.extra_body:
+            raise ApiStreamError("model_name is required (or provide model via extra_body)")
 
     async def _iter_stream_chunks(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
         """发起流式请求并逐条产出已解析的 chunk。"""
         url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": "Mozilla/5.0 (Windows NT 6.1; WOW64; Trident/7.0; SLCC2; .NET CLR 2.0.50727; .NET CLR 3.5.30729; .NET CLR 3.0.30729; .NET4.0C; .NET4.0E; rv:11.0) like Gecko"
-        }
+        headers = build_request_headers(self.api_key, self.extra_headers)
         timeout = httpx.Timeout(self.timeout_seconds)
 
         try:
@@ -151,19 +158,33 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
 
 
 def build_model_client(config: AppConfig) -> StreamModelClient:
-    if config.api_key:
-        return OpenAICompatibleStreamModelClient(
-            base_url=config.base_url,
-            api_key=config.api_key,
-            model_name=config.model_name,
-        )
-    return EchoStreamModelClient()
+    """按配置构建客户端。
+
+    与旧行为差异：不再以 ``api_key`` 是否存在作为分支条件。
+    ``api_key`` 为空时照样发起真实请求（无鉴权端点、或鉴权完全交由
+    ``extra_headers`` 处理）；需要离线跑流程请显式用 ``dry_run: true``。
+    """
+    if config.dry_run:
+        return EchoStreamModelClient()
+    return OpenAICompatibleStreamModelClient(
+        base_url=config.base_url,
+        api_key=config.api_key,
+        model_name=config.model_name,
+        extra_body=config.extra_body,
+        extra_headers=config.extra_headers,
+    )
 
 
-def build_chat_completions_payload(model_name: str, prompt: str) -> dict[str, Any]:
-    return {
+def build_chat_completions_payload(
+    model_name: str,
+    prompt: str,
+    extra_body: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "model": model_name,
         "stream": True,
+        # "thinking": {"type": "disabled"},
+        "reasoning_effort": "low",
         "messages": [
             {
                 "role": "user",
@@ -171,11 +192,13 @@ def build_chat_completions_payload(model_name: str, prompt: str) -> dict[str, An
             }
         ],
     }
+    return apply_extra_body(payload, extra_body)
 
 def build_tool_completion_payload(
     model_name: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
+    extra_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """带工具调用的请求体。
 
@@ -191,7 +214,83 @@ def build_tool_completion_payload(
     if tools:
         payload["tools"] = tools
         payload["tool_choice"] = "auto"
-    return payload
+    return apply_extra_body(payload, extra_body)
+
+
+def apply_extra_body(
+    payload: dict[str, Any],
+    extra_body: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """把自定义字段深合并进请求体。
+
+    规约：
+    - dict 递归合并；
+    - list / 标量整体覆盖（便于直接指定 ``messages`` 以外的数组型参数）；
+    - 值为 ``None`` 时删除同名键（用于屏蔽默认参数，例如去掉 ``reasoning_effort``）。
+    """
+    if not extra_body:
+        return payload
+    return merge_mapping(payload, extra_body)
+
+
+def merge_mapping(base: dict[str, Any], overlay: Mapping[str, Any]) -> dict[str, Any]:
+    for key, value in overlay.items():
+        if value is None:
+            base.pop(key, None)
+            continue
+        current = base.get(key)
+        if isinstance(current, dict) and isinstance(value, Mapping):
+            base[key] = merge_mapping(dict(current), value)
+        else:
+            base[key] = value
+    return base
+
+
+def build_request_headers(
+    api_key: str,
+    extra_headers: Mapping[str, Any] | None = None,
+) -> dict[str, str]:
+    """组合请求头。
+
+    - ``api_key`` 非空时默认使用 ``Authorization: Bearer <key>``；
+    - ``extra_headers`` 中的键**大小写不敏感**地覆盖同名默认头，
+      因此可以整条改写为 ``x-api-key``、``api-key`` 等各家写法；
+    - ``extra_headers`` 中值为 ``None`` 的键会删除该默认头（例如不带 User-Agent）；
+    - 非字符串值（int/bool/嵌套）会被转成字符串或 JSON。
+    """
+    headers: dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "User-Agent": DEFAULT_USER_AGENT,
+    }
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    lowercase_index = {key.lower(): key for key in headers}
+    for raw_name, raw_value in (extra_headers or {}).items():
+        name = str(raw_name).strip()
+        if not name:
+            continue
+        existing = lowercase_index.pop(name.lower(), None)
+        if raw_value is None:
+            if existing is not None:
+                headers.pop(existing, None)
+            continue
+        if existing is not None and existing != name:
+            headers.pop(existing, None)
+        headers[name] = stringify_header_value(raw_value)
+        lowercase_index[name.lower()] = name
+    return headers
+
+
+def stringify_header_value(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 @dataclass
 class ToolCallAccumulator:

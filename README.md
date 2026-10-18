@@ -102,7 +102,7 @@ pip install pyyaml lxml httpx
 - 更丰富的多提供方适配
 - Anthropic 显式缓存断点（`cache.mode: explicit` 已预留配置，客户端尚未实现）
 
-如果 `config.yaml` 中 `model.api_key` 为空，系统会退回到 `src/llm_client.py` 中的占位客户端，仅返回空增量 YAML，用于本地打通流程。
+如果 `config.yaml` 中 `model.api_key` 为空，系统**不再**退回占位客户端——很多自建端点（Ollama / vLLM / LM Studio / 无鉴权反代）本来就不需要 key，留空即表示“不发 `Authorization` 头”。若确实想离线跑通流程而不发任何网络请求，请显式设置 `model.dry_run: true`。
 
 ---
 
@@ -133,6 +133,9 @@ model:
   streaming: true
   base_url: https://api.openai.com/v1
   api_key: <KEY>
+  dry_run: false
+  extra_body: {}
+  extra_headers: {}
 runtime:
   resume: true
   retry_count: 3
@@ -191,7 +194,50 @@ batching:
 模型服务地址，当前会拼接为 `{{base_url}}/chat/completions` 发起请求。
 
 #### `model.api_key`
-模型 API Key。若留空，则自动退回到占位客户端，不会请求真实在线模型。
+模型 API Key。非空时会自动附加 `Authorization: Bearer <key>`；留空则**完全不发**该头（适配无鉴权端点）。
+若提供方的鉴权写法不是 Bearer（例如 `x-api-key`、`api-key`、`Token ...`），保持 `api_key` 为空、在 `model.extra_headers` 里直接写该头即可，或保留 `api_key` 并用 `extra_headers` 覆盖同名头。
+
+#### `model.dry_run`
+为 `true` 时使用离线 Echo 客户端（不发起网络请求），仅用于本地打通流程与测试。默认 `false`。
+
+#### `model.extra_body`
+追加/覆盖到 `/chat/completions` 请求体的字段，用于适配各家 API 的额外参数要求。合并规则：
+
+- 映射递归深合并（例如 `stream_options: {include_usage: true, x: 1}` 会保留默认的 `include_usage`）；
+- 列表与标量**整体覆盖**（例如 `tools: []` 会清空工具列表）；
+- 值为 `null` 表示**删除**请求体中该键（例如 `reasoning_effort: null` 去掉默认的 `reasoning_effort`）；
+- 可直接在 `extra_body` 里写 `model`，当 `model.name` 留空时作为模型名来源。
+
+典型用法：
+
+```yaml
+model:
+  extra_body:
+    reasoning_effort: null            # 删掉默认值
+    thinking: {type: enabled}         # 显式打开思考
+    chat_template_kwargs: {enable_thinking: false}
+    top_k: 20
+    parallel_tool_calls: false
+    search: {enable: true}
+```
+
+#### `model.extra_headers`
+追加/覆盖请求头，键**大小写不敏感**（`authorization` 与 `Authorization` 视为同一个头，不会重复发送）。
+
+- 值为 `null` 表示删除该默认头（例如不想发送默认 `User-Agent`）；
+- 非字符串值会自动转字符串：数字 → `5`，布尔 → `true`/`false`，对象 → 紧凑 JSON；
+- 键为空白的条目会被忽略。
+
+```yaml
+model:
+  extra_headers:
+    Authorization: null             # 去掉默认 Bearer
+    x-api-key: <KEY>                # 改用别家鉴权
+    anthropic-version: "2023-06-01"
+    X-Title: epub2dict
+```
+
+两项配置都会同时作用于 `stream_yaml`（legacy 管线）与 `complete_with_tools`（agent 管线），不会只对其中一条生效。
 
 #### `runtime.resume`
 是否启用断点恢复。启用后会复用已有进度文件。

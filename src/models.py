@@ -334,6 +334,12 @@ class AppConfig:
     streaming: bool = True
     base_url: str = "https://api.openai.com/v1"
     api_key: str = ""
+    # 追加到请求体的字段（深合并进默认 payload；值为 None 表示删除该键）
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    # 追加/覆盖的请求头（键大小写不敏感；值为 None 表示删除该头）
+    extra_headers: dict[str, Any] = field(default_factory=dict)
+    # 为 True 时使用离线 Echo 客户端（不发起网络请求）
+    dry_run: bool = False
     batching: BatchingConfig = field(default_factory=BatchingConfig)
     blacklist_keywords: list[str] = field(default_factory=list)
     merge: MergeConfig = field(default_factory=MergeConfig)

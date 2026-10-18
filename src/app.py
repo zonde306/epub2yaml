@@ -69,6 +69,9 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         streaming=bool(model.get("streaming", True)),
         base_url=str(model.get("base_url", "https://api.openai.com/v1")),
         api_key=str(model.get("api_key", "")),
+        extra_body=normalize_extra_body(model.get("extra_body")),
+        extra_headers=normalize_extra_headers(model.get("extra_headers")),
+        dry_run=bool(model.get("dry_run", False)),
         batching=BatchingConfig(
             enable_multi_chapter=bool(batching.get("enable_multi_chapter", True)),
             max_input_tokens=int(batching.get("max_input_tokens", 12000)),
@@ -107,6 +110,33 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
 
 
 
+def normalize_extra_body(value: Any) -> dict[str, Any]:
+    """归一化 ``model.extra_body``。
+
+    必须是映射；非映射（字符串/列表/null）视为未配置，避免把非法结构带进请求体。
+    值为 ``None`` 的键保留——它表示“从默认请求体中删除该键”。
+    """
+    if not isinstance(value, dict):
+        return {}
+    return {str(key): item for key, item in value.items() if str(key).strip()}
+
+
+def normalize_extra_headers(value: Any) -> dict[str, Any]:
+    """归一化 ``model.extra_headers``。
+
+    键为空白的丢弃；值保留原类型，由 ``build_request_headers`` 负责转字符串。
+    """
+    if not isinstance(value, dict):
+        return {}
+    normalized: dict[str, Any] = {}
+    for key, item in value.items():
+        name = str(key).strip()
+        if not name:
+            continue
+        normalized[name] = item
+    return normalized
+
+
 def ensure_project_layout(config_path: Path = DEFAULT_CONFIG_PATH, *, force: bool = False) -> Path:
     DEFAULT_INPUT_DIR.mkdir(parents=True, exist_ok=True)
     DEFAULT_WORKSPACE_DIR.mkdir(parents=True, exist_ok=True)
@@ -142,6 +172,9 @@ def default_raw_config() -> dict[str, Any]:
             "streaming": True,
             "base_url": "https://api.openai.com/v1",
             "api_key": "",
+            "extra_body": {},
+            "extra_headers": {},
+            "dry_run": False,
         },
         "runtime": {
             "resume": True,

@@ -16,7 +16,35 @@ model:
   name: gpt-4.1
   streaming: true
   base_url: https://api.openai.com/v1
+  # api_key 可为空：自建 / Ollama / vLLM / LM Studio 等无鉴权端点不必填。
+  # 非空时自动加 `Authorization: Bearer <key>`；要换别家写法请在 extra_headers 里覆盖。
   api_key: <KEY>
+  # dry_run: true 时不发网络请求，用离线 Echo 客户端打通流程（旧行为是靠 api_key 为空触发）
+  dry_run: false
+
+  # 追加/覆盖到 /chat/completions 请求体的字段（深合并）
+  # - dict 递归合并；list / 标量整体覆盖
+  # - 值写 null 表示从默认请求体中删除该键
+  extra_body: {}
+  # extra_body:
+  #   reasoning_effort: null        # 删掉默认的 reasoning_effort
+  #   thinking: {type: enabled}     # 显式打开思考
+  #   top_k: 20
+  #   chat_template_kwargs: {enable_thinking: false}
+  #   parallel_tool_calls: false
+  #   search: {enable: true}
+
+  # 追加/覆盖请求头（键大小写不敏感）
+  # - 值写 null 表示删除该默认头
+  # - bool / 数字 / 对象会自动转成字符串
+  extra_headers: {}
+  # extra_headers:
+  #   Authorization: null            # 去掉默认 Bearer 头
+  #   x-api-key: <KEY>               # 改用别家鉴权写法
+  #   api-key: <KEY>
+  #   anthropic-version: "2023-06-01"
+  #   X-Title: epub2dict
+  #   User-Agent: null               # 连默认 UA 也不发
 runtime:
   resume: true
   retry_count: 3

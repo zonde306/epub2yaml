@@ -24,6 +24,7 @@ from llm_client import (  # noqa: E402
     accumulate_tool_call_deltas,
     build_chat_completions_payload,
     build_model_client,
+    build_request_headers,
     build_tool_completion_payload,
     detect_root_key,
     extract_stream_delta_text,
@@ -969,7 +970,8 @@ class LlmClientTests(unittest.TestCase):
         self.assertFalse(completion.turn.has_tool_calls)
         self.assertEqual(completion.finish_reason, "stop")
 
-    def test_build_model_client_without_api_key_returns_echo_client(self) -> None:
+    def test_build_model_client_without_api_key_still_uses_real_client(self) -> None:
+        """无 api_key 不应被拦下：很多端点不需要鉴权。"""
         config = AppConfig(
             input_epubs=[],
             schema_paths=[],
@@ -978,7 +980,37 @@ class LlmClientTests(unittest.TestCase):
             api_key="",
         )
         client = build_model_client(config)
+        self.assertEqual(client.__class__.__name__, "OpenAICompatibleStreamModelClient")
+
+    def test_build_model_client_dry_run_returns_echo_client(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            api_key="",
+            dry_run=True,
+        )
+        client = build_model_client(config)
         self.assertEqual(client.__class__.__name__, "EchoStreamModelClient")
+
+    def test_build_model_client_passes_extra_body_and_headers(self) -> None:
+        config = AppConfig(
+            input_epubs=[],
+            schema_paths=[],
+            prompt_templates=[],
+            workspace_root=Path("workspace"),
+            api_key="",
+            base_url="http://127.0.0.1:11434/v1",
+            model_name="qwen3",
+            extra_body={"top_k": 20},
+            extra_headers={"x-api-key": "abc", "Authorization": None},
+        )
+        client = build_model_client(config)
+        self.assertIsInstance(client, OpenAICompatibleStreamModelClient)
+        assert isinstance(client, OpenAICompatibleStreamModelClient)
+        self.assertEqual(client.extra_body, {"top_k": 20})
+        self.assertEqual(client.extra_headers, {"x-api-key": "abc", "Authorization": None})
 
     def test_build_model_client_with_api_key_returns_real_client(self) -> None:
         config = AppConfig(
@@ -993,14 +1025,113 @@ class LlmClientTests(unittest.TestCase):
         client = build_model_client(config)
         self.assertEqual(client.__class__.__name__, "OpenAICompatibleStreamModelClient")
 
-    def test_real_client_requires_api_key(self) -> None:
+    def test_real_client_without_api_key_does_not_raise_on_credentials(self) -> None:
+        """无 key 的客户端应能构建，只在 model name 也缺失时才报错。"""
+        client = OpenAICompatibleStreamModelClient(
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="",
+            model_name="qwen3",
+        )
+        client._require_request_params()
+
+    def test_real_client_requires_model_name(self) -> None:
         client = OpenAICompatibleStreamModelClient(
             base_url="https://api.openai.com/v1",
-            api_key="",
-            model_name="gpt-4.1",
+            api_key="secret",
+            model_name="",
         )
         with self.assertRaises(ApiStreamError):
             asyncio.run(self._collect_stream(client, "hello"))
+
+    def test_model_name_can_come_from_extra_body(self) -> None:
+        client = OpenAICompatibleStreamModelClient(
+            base_url="http://127.0.0.1:11434/v1",
+            model_name="",
+            extra_body={"model": "deepseek-chat"},
+        )
+        client._require_request_params()
+        payload = build_chat_completions_payload(
+            client.model_name, "x", extra_body=client.extra_body
+        )
+        self.assertEqual(payload["model"], "deepseek-chat")
+
+    def test_extra_body_deep_merges_and_overrides(self) -> None:
+        payload = build_tool_completion_payload(
+            "m",
+            [{"role": "user", "content": "x"}],
+            [{"type": "function", "function": {"name": "t"}}],
+            extra_body={
+                "stream_options": {"include_usage": True, "extra": "kept"},
+                "top_k": 20,
+                "tools": [],
+            },
+        )
+
+        self.assertEqual(payload["stream_options"], {"include_usage": True, "extra": "kept"})
+        self.assertEqual(payload["top_k"], 20)
+        self.assertEqual(payload["tools"], [])
+        self.assertEqual(payload["tool_choice"], "auto")
+
+    def test_extra_body_none_value_removes_default_key(self) -> None:
+        payload = build_chat_completions_payload(
+            "m", "x", extra_body={"reasoning_effort": None, "thinking": {"type": "enabled"}}
+        )
+
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertEqual(payload["thinking"], {"type": "enabled"})
+
+    def test_extra_body_empty_is_noop(self) -> None:
+        baseline = build_chat_completions_payload("m", "x")
+        self.assertEqual(
+            build_chat_completions_payload("m", "x", extra_body={}), baseline
+        )
+        self.assertEqual(
+            build_chat_completions_payload("m", "x", extra_body=None), baseline
+        )
+
+    def test_build_request_headers_with_api_key(self) -> None:
+        headers = build_request_headers("secret")
+
+        self.assertEqual(headers["Authorization"], "Bearer secret")
+        self.assertEqual(headers["Content-Type"], "application/json")
+
+    def test_build_request_headers_without_api_key_omits_authorization(self) -> None:
+        headers = build_request_headers("")
+
+        self.assertNotIn("Authorization", headers)
+        self.assertEqual(headers["Accept"], "text/event-stream")
+
+    def test_extra_headers_override_is_case_insensitive(self) -> None:
+        headers = build_request_headers(
+            "secret", {"authorization": "Token xyz", "CONTENT-TYPE": "application/json; charset=utf-8"}
+        )
+
+        auth_keys = [key for key in headers if key.lower() == "authorization"]
+        self.assertEqual(len(auth_keys), 1)
+        self.assertEqual(headers[auth_keys[0]], "Token xyz")
+        content_keys = [key for key in headers if key.lower() == "content-type"]
+        self.assertEqual(len(content_keys), 1)
+        self.assertEqual(headers[content_keys[0]], "application/json; charset=utf-8")
+
+    def test_extra_headers_none_removes_default_header(self) -> None:
+        headers = build_request_headers("secret", {"User-Agent": None, "Authorization": None})
+
+        self.assertNotIn("User-Agent", headers)
+        self.assertNotIn("Authorization", headers)
+
+    def test_extra_headers_values_are_stringified(self) -> None:
+        headers = build_request_headers(
+            "", {"X-Num": 5, "X-Bool": True, "X-Obj": {"a": 1}}
+        )
+
+        self.assertEqual(headers["X-Num"], "5")
+        self.assertEqual(headers["X-Bool"], "true")
+        self.assertEqual(headers["X-Obj"], '{"a":1}')
+
+    def test_extra_headers_blank_name_ignored(self) -> None:
+        headers = build_request_headers("", {"  ": "boom"})
+
+        self.assertNotIn("boom", headers.values())
 
     async def _collect_stream(self, client: Any, prompt: str) -> list[str]:
         result = []
