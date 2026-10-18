@@ -5,3 +5,6 @@ prompts/*
 schemas/*
 input/*
 /config.yaml
+
+# 修复/迁移时的临时数据备份（仅本地保留）
+workspace_backup_*/

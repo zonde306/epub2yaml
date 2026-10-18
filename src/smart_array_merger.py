@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from typing import Any
 
+from models import MergeConfig
 
-@dataclass(slots=True)
-class MergeConfig:
-    """合并配置"""
-    similarity_threshold: float = 0.6
-    field_weights: dict[str, float] = field(default_factory=dict)
+__all__ = ["MergeConfig", "SmartArrayMerger"]
 
 
 class SmartArrayMerger:
@@ -90,6 +86,10 @@ class SmartArrayMerger:
             return best_index, best_similarity
         return None
     
+    def similarity(self, value1: Any, value2: Any, current_path: str = "") -> float:
+        """公开的相似度入口，供重名检查等外部调用复用。"""
+        return self._calculate_similarity(value1, value2, current_path)
+
     def _calculate_similarity(
         self,
         value1: Any,

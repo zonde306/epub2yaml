@@ -88,6 +88,21 @@ class WorkspacePaths:
     def output_path_for_schema(self, schema_name: str) -> Path:
         return self.output_dir / f"{schema_name}.yaml"
 
+    def session_dir_for_schema(self, schema_name: str) -> Path:
+        return self.root / "session" / schema_name
+
+    def messages_path_for_schema(self, schema_name: str) -> Path:
+        return self.session_dir_for_schema(schema_name) / "messages.jsonl"
+
+    def journal_path_for_schema(self, schema_name: str) -> Path:
+        return self.session_dir_for_schema(schema_name) / "journal.jsonl"
+
+    def index_path_for_schema(self, schema_name: str) -> Path:
+        return self.session_dir_for_schema(schema_name) / "index.yaml"
+
+    def session_meta_path_for_schema(self, schema_name: str) -> Path:
+        return self.session_dir_for_schema(schema_name) / "meta.yaml"
+
     def progress_path_for_schema(self, schema_name: str) -> Path:
         return self.state_dir / f"{schema_name}.progress.yaml"
 
@@ -277,6 +292,32 @@ class BatchingConfig:
 
 
 @dataclass(slots=True)
+class SessionConfig:
+    """对话式抽取会话配置。"""
+
+    enabled: bool = True
+    max_context_tokens: int = 64000
+    max_tool_rounds_per_segment: int = 12
+    rotate_on_checkpoint: bool = True
+    persist_messages: bool = True
+    index_detail: str = "compact"
+
+@dataclass(slots=True)
+class ToolConfig:
+    """编辑工具开关。"""
+
+    allow_remove: bool = False
+    allow_full_write: bool = False
+    near_duplicate_check: bool = True
+
+@dataclass(slots=True)
+class CacheConfig:
+    """缓存模式：implicit 为 DeepSeek/OpenAI 自动前缀缓存，explicit 为 Anthropic 显式断点。"""
+
+    mode: str = "implicit"
+    log_hit_tokens: bool = True
+
+@dataclass(slots=True)
 class AppConfig:
     input_epubs: list[Path]
     schema_paths: list[Path]
@@ -296,6 +337,14 @@ class AppConfig:
     batching: BatchingConfig = field(default_factory=BatchingConfig)
     blacklist_keywords: list[str] = field(default_factory=list)
     merge: MergeConfig = field(default_factory=MergeConfig)
+    pipeline_mode: str = "legacy"
+    session: SessionConfig = field(default_factory=SessionConfig)
+    tools: ToolConfig = field(default_factory=ToolConfig)
+    cache: CacheConfig = field(default_factory=CacheConfig)
+
+    @property
+    def use_agent_pipeline(self) -> bool:
+        return self.pipeline_mode.strip().lower() == "agent"
 
 
 @dataclass(slots=True)
@@ -327,6 +376,59 @@ class TaskRuntimeState:
     stream_buffer_path: str
 
 
+@dataclass(slots=True)
+class ToolCall:
+    """模型请求的一次工具调用。"""
+
+    id: str
+    name: str
+    arguments: str
+
+    def to_message_part(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {"name": self.name, "arguments": self.arguments},
+        }
+
+    @classmethod
+    def from_message_part(cls, part: dict[str, Any]) -> "ToolCall":
+        function = part.get("function") or {}
+        return cls(
+            id=str(part.get("id", "")),
+            name=str(function.get("name", "")),
+            arguments=str(function.get("arguments", "") or ""),
+        )
+
+@dataclass(slots=True)
+class AssistantTurn:
+    """一次模型回复，可能携带工具调用。"""
+
+    content: str = ""
+    tool_calls: list[ToolCall] = field(default_factory=list)
+
+    @property
+    def has_tool_calls(self) -> bool:
+        return bool(self.tool_calls)
+
+@dataclass(slots=True)
+class ToolCompletion:
+    """工具调用轮次的完整结果：回复内容 + 用量。"""
+
+    turn: AssistantTurn
+    usage: dict[str, Any] = field(default_factory=dict)
+    finish_reason: str = ""
+
 class StreamModelClient(Protocol):
-    async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
+    # 注意：不能写成 `async def`。async 生成器实现返回的是 AsyncIterable，
+    # 若此处声明为 async，返回类型会变成 Coroutine，调用方无法 `async for`。
+    def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
+        ...
+
+    def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> Any:
+        """流式完成一次带工具调用的回复，返回 ``ToolCompletion``。"""
         ...

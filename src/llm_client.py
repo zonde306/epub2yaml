@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, AsyncIterator
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
 
-from models import AppConfig, StreamModelClient
+from models import AppConfig, AssistantTurn, StreamModelClient, ToolCall, ToolCompletion
 
 ROOT_PATTERNS = [
     re.compile(r"输出根节点必须是\s+([a-zA-Z_][a-zA-Z0-9_]*)"),
@@ -35,6 +36,17 @@ class EchoStreamModelClient(StreamModelClient):
         for line in content.splitlines(keepends=True):
             yield line
 
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ToolCompletion:
+        """占位实现：不调用 API，也不发起工具调用。
+
+        用于未配置 api_key 时打通流程。它会结束当前段落而不产生任何编辑。
+        """
+        return ToolCompletion(turn=AssistantTurn(content="noop"), finish_reason="stop")
+
 
 class OpenAICompatibleStreamModelClient(StreamModelClient):
     def __init__(
@@ -51,13 +63,60 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
         self.timeout_seconds = timeout_seconds
 
     async def stream_yaml(self, prompt: str) -> AsyncIterable[str]:
+        self._require_credentials()
+        payload = build_chat_completions_payload(self.model_name, prompt)
+        async for chunk in self._iter_stream_chunks(payload):
+            text = extract_stream_delta_text(chunk)
+            if text:
+                yield text
+
+    async def complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> ToolCompletion:
+        """流式完成一次带工具调用的回复。
+
+        工具调用参数在流中按片段到达，需按 index 累积后才能解析。
+        """
+        self._require_credentials()
+        payload = build_tool_completion_payload(self.model_name, messages, tools)
+        accumulator: dict[int, ToolCallAccumulator] = {}
+        content_parts: list[str] = []
+        usage: dict[str, Any] = {}
+        finish_reason = ""
+
+        async for chunk in self._iter_stream_chunks(payload):
+            choice = first_choice_of(chunk)
+            if choice:
+                delta = choice.get("delta")
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        content_parts.append(content)
+                    accumulate_tool_call_deltas(accumulator, delta.get("tool_calls"))
+                reason = choice.get("finish_reason")
+                if isinstance(reason, str) and reason:
+                    finish_reason = reason
+            chunk_usage = extract_stream_usage(chunk)
+            if chunk_usage:
+                usage.update(chunk_usage)
+
+        return ToolCompletion(
+            turn=AssistantTurn(content="".join(content_parts), tool_calls=finalize_tool_calls(accumulator)),
+            usage=usage,
+            finish_reason=finish_reason,
+        )
+
+    def _require_credentials(self) -> None:
         if not self.api_key:
             raise ApiStreamError("api_key is required for real API streaming")
         if not self.model_name:
             raise ApiStreamError("model_name is required for real API streaming")
 
+    async def _iter_stream_chunks(self, payload: dict[str, Any]) -> AsyncIterator[dict[str, Any]]:
+        """发起流式请求并逐条产出已解析的 chunk。"""
         url = f"{self.base_url}/chat/completions"
-        payload = build_chat_completions_payload(self.model_name, prompt)
         headers = {
             "Content-Type": "application/json",
             "Accept": "text/event-stream",
@@ -81,13 +140,9 @@ class OpenAICompatibleStreamModelClient(StreamModelClient):
                             break
 
                         try:
-                            chunk = json.loads(data)
+                            yield json.loads(data)
                         except json.JSONDecodeError as exc:
                             raise ApiStreamError(f"invalid stream chunk json: {exc}") from exc
-
-                        text = extract_stream_delta_text(chunk)
-                        if text:
-                            yield text
         except httpx.HTTPStatusError as exc:
             message = read_http_error(exc.response, fallback_message=str(exc))
             raise ApiStreamError(f"http error {exc.response.status_code}: {message}") from exc
@@ -116,6 +171,111 @@ def build_chat_completions_payload(model_name: str, prompt: str) -> dict[str, An
             }
         ],
     }
+
+def build_tool_completion_payload(
+    model_name: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """带工具调用的请求体。
+
+    包含 ``stream_options.include_usage``，否则流式响应不会返回 usage，
+    也就无法观测缓存命中（``prompt_cache_hit_tokens``）。
+    """
+    payload: dict[str, Any] = {
+        "model": model_name,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "messages": messages,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    return payload
+
+@dataclass
+class ToolCallAccumulator:
+    """流式工具调用参数的累积器。
+
+    OpenAI 兼容流会按 index 分片下发 ``function.arguments``，必须拼接后才能解析。
+    """
+
+    index: int
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+    def update(self, *, call_id: str = "", name: str = "", arguments: str = "") -> None:
+        if call_id:
+            self.id = call_id
+        # name 与 arguments 都可能被提供方拆成多片下发，必须拼接而不是覆盖。
+        if name:
+            self.name += name
+        if arguments:
+            self.arguments += arguments
+
+def first_choice_of(chunk: dict[str, Any]) -> dict[str, Any] | None:
+    choices = chunk.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    return first if isinstance(first, dict) else None
+
+def accumulate_tool_call_deltas(
+    accumulator: dict[int, ToolCallAccumulator],
+    tool_call_deltas: Any,
+) -> None:
+    if not isinstance(tool_call_deltas, list):
+        return
+    for position, item in enumerate(tool_call_deltas):
+        if not isinstance(item, dict):
+            continue
+        raw_index = item.get("index")
+        index = int(raw_index) if isinstance(raw_index, int) else position
+        entry = accumulator.get(index)
+        if entry is None:
+            entry = ToolCallAccumulator(index=index)
+            accumulator[index] = entry
+        function = item.get("function")
+        function = function if isinstance(function, dict) else {}
+        entry.update(
+            call_id=str(item.get("id", "") or ""),
+            name=str(function.get("name", "") or ""),
+            arguments=str(function.get("arguments", "") or ""),
+        )
+
+def finalize_tool_calls(accumulator: dict[int, ToolCallAccumulator]) -> list[ToolCall]:
+    calls: list[ToolCall] = []
+    for index in sorted(accumulator):
+        entry = accumulator[index]
+        if not entry.name:
+            continue
+        calls.append(
+            ToolCall(
+                id=entry.id or f"call_{index}",
+                name=entry.name,
+                arguments=entry.arguments or "{}",
+            )
+        )
+    return calls
+
+def extract_stream_usage(chunk: dict[str, Any]) -> dict[str, Any]:
+    """提取 usage，包括 DeepSeek 的缓存命中/未命中字段。"""
+    usage = chunk.get("usage")
+    if not isinstance(usage, dict) or not usage:
+        return {}
+    extracted: dict[str, Any] = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_cache_hit_tokens",
+        "prompt_cache_miss_tokens",
+    ):
+        value = usage.get(key)
+        if isinstance(value, int):
+            extracted[key] = value
+    return extracted
 
 
 def extract_stream_delta_text(chunk: dict[str, Any]) -> str:

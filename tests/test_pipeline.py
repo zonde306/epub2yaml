@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 import tempfile
 import unittest
+from email.message import Message
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from typing import Any, AsyncIterator, cast
+from unittest.mock import patch
 from urllib import error
 
 import yaml
@@ -16,11 +19,17 @@ from app import restore_command, run_command  # noqa: E402
 from checkpoint_store import CheckpointStore  # noqa: E402
 from llm_client import (  # noqa: E402
     ApiStreamError,
+    EchoStreamModelClient,
     OpenAICompatibleStreamModelClient,
-    build_model_client,
+    accumulate_tool_call_deltas,
     build_chat_completions_payload,
+    build_model_client,
+    build_tool_completion_payload,
     detect_root_key,
     extract_stream_delta_text,
+    extract_stream_usage,
+    finalize_tool_calls,
+    first_choice_of,
     normalize_base_url,
     read_http_error,
 )
@@ -128,7 +137,7 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIsNotNone(data)
-        self.assertIn("actors", data)
+        self.assertIn("actors", data or {})
 
     def test_parse_yaml_text_strips_yaml_markdown_code_block(self) -> None:
         yaml_text = "```yaml\nactors:\n  - name: 张三\n```"
@@ -136,7 +145,7 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIsNotNone(data)
-        self.assertIn("actors", data)
+        self.assertIn("actors", data or {})
 
     def test_parse_yaml_text_strips_yaml_markdown_code_block_uppercase(self) -> None:
         yaml_text = "```YAML\nactors:\n  - name: 张三\n```"
@@ -144,7 +153,7 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIsNotNone(data)
-        self.assertIn("actors", data)
+        self.assertIn("actors", data or {})
 
     def test_parse_yaml_text_handles_missing_closing_backticks(self) -> None:
         yaml_text = "```yaml\nactors:\n  - name: 张三"
@@ -152,7 +161,7 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIsNotNone(data)
-        self.assertIn("actors", data)
+        self.assertIn("actors", data or {})
 
     def test_parse_yaml_text_handles_plain_yaml_without_code_block(self) -> None:
         yaml_text = "actors:\n  - name: 张三"
@@ -160,7 +169,7 @@ class SchemaValidatorTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertIsNotNone(data)
-        self.assertIn("actors", data)
+        self.assertIn("actors", data or {})
 
     def test_sanitize_increment_data_removes_empty_values_and_trims_strings(self) -> None:
         payload = {
@@ -443,7 +452,39 @@ class YamlStoreTests(unittest.TestCase):
             },
         )
 
-    def test_merge_increment_replaces_lists_as_a_whole(self) -> None:
+    def test_merge_increment_appends_unmatched_list_items(self) -> None:
+        """数组语义为「相似替换 + 追加」，见 plans/yaml-array-merge-design.md。
+
+        旧断言（整替）与合并规则设计冲突：相似度超阈值时原位替换，否则追加。
+        本用例用相似度 0.0 的值，验证追加分支。
+        """
+        current = {
+            "worldinfo": {
+                "黑风寨": {
+                    "trigger_keywords": ["旧关键字", "别名"],
+                }
+            }
+        }
+        increment = {
+            "worldinfo": {
+                "黑风寨": {
+                    "trigger_keywords": ["封印之地"],
+                }
+            }
+        }
+
+        merged, stats = self.store.merge_increment(current, increment, self.schema)
+
+        self.assertEqual(stats.replaced_nodes, 1)
+        merged_keywords = merged["worldinfo"]["黑风寨"]["trigger_keywords"]
+        # 无相似元素可匹配，原数组全部保留，新元素追加到末尾
+        self.assertEqual(merged_keywords, ["旧关键字", "别名", "封印之地"])
+
+    def test_merge_increment_replaces_similar_list_items_in_place(self) -> None:
+        """相似度超过阈值（默认 0.6）的数组元素在原文位置被替换，不产生新元素。
+
+        "旧关键字" 与 "新关键字" 相似度为 0.75。
+        """
         current = {
             "worldinfo": {
                 "黑风寨": {
@@ -459,10 +500,9 @@ class YamlStoreTests(unittest.TestCase):
             }
         }
 
-        merged, stats = self.store.merge_increment(current, increment, self.schema)
+        merged, _ = self.store.merge_increment(current, increment, self.schema)
 
-        self.assertEqual(stats.replaced_nodes, 1)
-        self.assertEqual(merged["worldinfo"]["黑风寨"]["trigger_keywords"], ["新关键字"])
+        self.assertEqual(merged["worldinfo"]["黑风寨"]["trigger_keywords"], ["新关键字", "别名"])
 
     def test_merge_increment_requires_mapping_value(self) -> None:
         with self.assertRaises(ValueError):
@@ -600,7 +640,9 @@ class TaskRunnerTests(unittest.TestCase):
 
     def test_collect_stream_writes_stream_and_debug_response_files(self) -> None:
         class StubStreamModelClient:
-            async def stream_yaml(self, prompt: str):
+            last_prompt: str
+
+            async def stream_yaml(self, prompt: str) -> AsyncIterator[str]:
                 self.last_prompt = prompt
                 yield "worldinfo:\n"
                 yield "  黑风寨:\n"
@@ -615,7 +657,7 @@ class TaskRunnerTests(unittest.TestCase):
                 prompt_templates=[],
                 workspace_root=workspace_root,
             )
-            client = StubStreamModelClient()
+            client = cast(Any, StubStreamModelClient())
             runner = TaskRunner(config, model_client=client)
 
             stream_buffer_path = workspace_root / "epub" / "temp" / "world.stream.txt"
@@ -840,6 +882,93 @@ class LlmClientTests(unittest.TestCase):
         }
         self.assertEqual(extract_stream_delta_text(chunk), "ab")
 
+    def test_build_tool_completion_payload_includes_usage_and_tools(self) -> None:
+        messages = [{"role": "system", "content": "persona"}, {"role": "user", "content": "chapter"}]
+        tools = [{"type": "function", "function": {"name": "read_entry"}}]
+
+        payload = build_tool_completion_payload("deepseek-flash", messages, tools)
+
+        self.assertTrue(payload["stream"])
+        # 没有 include_usage 就无法观测缓存命中
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(payload["tools"], tools)
+        self.assertEqual(payload["tool_choice"], "auto")
+        self.assertIs(payload["messages"], messages)
+
+    def test_build_tool_completion_payload_omits_tools_when_empty(self) -> None:
+        payload = build_tool_completion_payload("m", [{"role": "user", "content": "x"}], [])
+
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_accumulates_tool_call_arguments_across_chunks(self) -> None:
+        accumulator: dict = {}
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "id": "call_a", "function": {"name": "upsert_entry", "arguments": "{\"key\":"}}])
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "function": {"arguments": "\"Alice\"}"}}])
+
+        calls = finalize_tool_calls(accumulator)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].id, "call_a")
+        self.assertEqual(calls[0].name, "upsert_entry")
+        self.assertEqual(json.loads(calls[0].arguments), {"key": "Alice"})
+
+    def test_accumulates_split_function_name(self) -> None:
+        """name 也可能被拆片下发，不能被后片覆盖。"""
+        accumulator: dict = {}
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "id": "c", "function": {"name": "upsert_"}}])
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "function": {"name": "entry"}}])
+
+        self.assertEqual(finalize_tool_calls(accumulator)[0].name, "upsert_entry")
+
+    def test_finalize_keeps_parallel_tool_calls_in_index_order(self) -> None:
+        accumulator: dict = {}
+        accumulate_tool_call_deltas(accumulator, [{"index": 1, "id": "b", "function": {"name": "read_entry"}}])
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "id": "a", "function": {"name": "list_entries"}}])
+
+        calls = finalize_tool_calls(accumulator)
+
+        self.assertEqual([call.name for call in calls], ["list_entries", "read_entry"])
+
+    def test_finalize_skips_calls_without_name(self) -> None:
+        accumulator: dict = {}
+        accumulate_tool_call_deltas(accumulator, [{"index": 0, "id": "a", "function": {"arguments": "{}"}}])
+
+        self.assertEqual(finalize_tool_calls(accumulator), [])
+
+    def test_finalize_generates_missing_id(self) -> None:
+        accumulator: dict = {}
+        accumulate_tool_call_deltas(accumulator, [{"index": 3, "function": {"name": "read_entry"}}])
+
+        self.assertEqual(finalize_tool_calls(accumulator)[0].id, "call_3")
+
+    def test_extract_stream_usage_includes_cache_fields(self) -> None:
+        usage = extract_stream_usage(
+            {"usage": {"prompt_tokens": 1000, "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}}
+        )
+
+        self.assertEqual(usage["prompt_cache_hit_tokens"], 900)
+        self.assertEqual(usage["prompt_cache_miss_tokens"], 100)
+
+    def test_extract_stream_usage_ignores_absent_or_malformed(self) -> None:
+        self.assertEqual(extract_stream_usage({"choices": []}), {})
+        self.assertEqual(extract_stream_usage({"usage": None}), {})
+        self.assertEqual(extract_stream_usage({"usage": {"prompt_tokens": "x"}}), {})
+
+    def test_first_choice_of_handles_shapes(self) -> None:
+        self.assertIsNone(first_choice_of({}))
+        self.assertIsNone(first_choice_of({"choices": []}))
+        self.assertIsNone(first_choice_of({"choices": ["x"]}))
+        self.assertEqual(first_choice_of({"choices": [{"finish_reason": "stop"}]}), {"finish_reason": "stop"})
+
+    def test_echo_client_tool_completion_returns_empty_turn(self) -> None:
+        client = EchoStreamModelClient()
+
+        completion = asyncio.run(client.complete_with_tools([{"role": "user", "content": "x"}], []))
+
+        self.assertFalse(completion.turn.has_tool_calls)
+        self.assertEqual(completion.finish_reason, "stop")
+
     def test_build_model_client_without_api_key_returns_echo_client(self) -> None:
         config = AppConfig(
             input_epubs=[],
@@ -873,7 +1002,7 @@ class LlmClientTests(unittest.TestCase):
         with self.assertRaises(ApiStreamError):
             asyncio.run(self._collect_stream(client, "hello"))
 
-    async def _collect_stream(self, client, prompt: str) -> list[str]:
+    async def _collect_stream(self, client: Any, prompt: str) -> list[str]:
         result = []
         async for chunk in client.stream_yaml(prompt):
             result.append(chunk)
@@ -884,7 +1013,7 @@ class LlmClientTests(unittest.TestCase):
             url="https://example.com",
             code=401,
             msg="Unauthorized",
-            hdrs=None,
+            hdrs=Message(),
             fp=None,
         )
         message = read_http_error(exc)

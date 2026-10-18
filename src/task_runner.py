@@ -9,10 +9,11 @@ from typing import Any
 
 from checkpoint_store import CheckpointStore
 from epub_reader import extract_epub
+from agent_runner import AgentRunner
 from llm_client import build_model_client
-from models import AppConfig, Chapter, ChapterBatch, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition, build_checkpoint_id
+from models import AppConfig, Chapter, ChapterBatch, MergeStats, PromptTemplate, SchemaDefinition, StreamModelClient, TaskDefinition, build_checkpoint_id
 from progress_store import ProgressStore
-from prompt_builder import PromptBuilder
+from prompt_builder import PromptBuilder, build_batch_source_text
 from prompt_loader import PromptLoader
 from schema_loader import SchemaLoader
 from schema_validator import SchemaValidator
@@ -59,6 +60,9 @@ class TaskRunner:
         self.progress_store = progress_store or ProgressStore()
         self.workspace_manager = workspace_manager or WorkspaceManager(config.workspace_root)
         self.checkpoint_store = checkpoint_store or CheckpointStore()
+        # 会话式流程需要跨批次复用同一个 ExtractionSession，
+        # 按 (epub, schema) 缓存 runner，否则每次批次都会重建时间线、缓存前缀断裂。
+        self._agent_runners: dict[tuple[str, str], AgentRunner] = {}
 
     def build_tasks(self) -> list[TaskDefinition]:
         tasks: list[TaskDefinition] = []
@@ -145,6 +149,46 @@ class TaskRunner:
             f"batch start range={batch.display_range} depth={batch.split_depth} count={batch.chapter_count} tokens={batch.token_estimate}",
         )
 
+        if self.config.use_agent_pipeline:
+            batch_result = await self._step_agent_batch(
+                state.task,
+                batch=batch,
+                total_chapters=len(state.chapters),
+                schema_definition=state.schema_definition,
+                progress=state.progress,
+            )
+            state.progress = batch_result["progress"]
+            if batch_result.get("needs_split"):
+                left_batch, right_batch = batch.split()
+                self._log(
+                    state.task,
+                    f"batch split parent={batch.batch_id} range={batch.display_range} -> "
+                    f"left={left_batch.display_range} right={right_batch.display_range} "
+                    f"reason={batch_result.get('split_reason', 'unknown')}",
+                )
+                # 会话模式必须按章节顺序推进：拆分后的子批次回插到队首，
+                # 否则后续章节会先于失败段执行，打断消息时间线。
+                state.pending_batches.appendleft(right_batch)
+                state.pending_batches.appendleft(left_batch)
+                return {
+                    "progress": state.progress,
+                    "is_completed": False,
+                    "is_failed": False,
+                }
+            if state.progress.get("status") == "failed":
+                state.is_failed = True
+                self._log(state.task, f"task failed last_error={self._last_error(state.progress)}")
+                return {
+                    "progress": state.progress,
+                    "is_completed": False,
+                    "is_failed": True,
+                }
+            return {
+                "progress": state.progress,
+                "is_completed": False,
+                "is_failed": False,
+            }
+
         batch_result = await self._run_batch_single(
             state.task,
             batch=batch,
@@ -185,12 +229,186 @@ class TaskRunner:
             "is_failed": False,
         }
 
-    async def run_task(self, task: TaskDefinition) -> dict[str, Any]:
-        """执行任务直到完成，保持向后兼容。
+    async def _step_agent_batch(
+        self,
+        task: TaskDefinition,
+        *,
+        batch: ChapterBatch,
+        total_chapters: int,
+        schema_definition: SchemaDefinition,
+        progress: dict[str, Any],
+    ) -> dict[str, Any]:
+        """会话式执行一个批次。
 
-        注意：此方法会一次性执行完整个任务。如需公平调度，
-        请使用 prepare_task_state 和 step_task 方法。
+        与 ``_run_batch`` 的关键区别：
+        - 模型不输出完整 YAML，而是通过编辑工具修改 output.yaml
+        - 消息前缀 append-only，schema 只出现一次，从而命中缓存
+        - 段落失败重试是追加新消息，不重跑整批 prompt
+
+        返回结构与 ``_run_batch_single`` 保持一致，便于 ``step_task`` 统一处理。
         """
+        runner = self._agent_runner_for(task, schema_definition)
+        runner.ensure_session(
+            total_chapters=total_chapters,
+            last_completed_chapter_index=int(progress.get("last_completed_chapter_index", 0) or 0),
+        )
+
+        source_text = build_batch_source_text(batch)
+        progress = self.progress_store.update_running(
+            progress,
+            batch=batch,
+            completed_chapters=int(progress.get("completed_chapters", 0) or 0),
+            total_chapters=total_chapters,
+            template=self._agent_template_stub(task),
+            attempted_templates=["agent"],
+            retry_attempt=0,
+            status="running",
+            last_error="",
+        )
+        self.progress_store.save(task.progress_path, progress)
+
+        result = await runner.run_segment(batch, source_text=source_text, total_chapters=total_chapters)
+        attempts = 1
+        while not result.ok and attempts < max(int(self.config.retry_count), 1):
+            self._log(task, f"segment failed attempt={attempts} reason={result.reason}")
+            progress = self.progress_store.update_validation(
+                progress,
+                result="failed",
+                error_count=max(result.error_count, 1),
+                last_error=result.reason,
+            )
+            self.progress_store.save(task.progress_path, progress)
+            if self.config.retry_backoff_seconds > 0:
+                await asyncio.sleep(self.config.retry_backoff_seconds)
+            result = await runner.repair_segment(
+                batch,
+                source_text=source_text,
+                total_chapters=total_chapters,
+                previous=result,
+            )
+            attempts += 1
+
+        if result.ok:
+            stats = MergeStats(replaced_nodes=result.edit_count, appended_nodes=0)
+            progress = self.progress_store.update_validation(progress, result="passed", error_count=0, last_error="")
+            progress = self.progress_store.update_merge(progress, stats)
+            progress = self.progress_store.mark_batch_completed(
+                progress,
+                batch=batch,
+                total_chapters=total_chapters,
+            )
+            self._record_agent_observability(progress, runner, batch)
+            self.progress_store.save(task.progress_path, progress)
+            checkpoint_id = self._maybe_save_checkpoint(
+                task,
+                schema_definition=schema_definition,
+                progress=progress,
+                total_chapters=total_chapters,
+            )
+            self._emit_agent_progress(task, schema_definition, progress, runner, result)
+            # 旋转点与 checkpoint 边界对齐：刚好保存了 checkpoint 的批次即为边界。
+            runner.maybe_rotate(total_chapters=total_chapters, at_checkpoint_boundary=bool(checkpoint_id))
+            self.workspace_manager.cleanup_stale_stream(task.stream_buffer_path)
+            if checkpoint_id:
+                self._log(task, f"checkpoint saved id={checkpoint_id} range={batch.display_range}")
+            self._log(
+                task,
+                f"segment completed range={batch.display_range} edits={result.edit_count} rounds={result.tool_rounds}",
+            )
+            return {"progress": progress, "needs_split": False}
+
+        progress = self.progress_store.mark_failed(
+            progress,
+            last_error=result.reason or "segment retries exhausted",
+            retry_attempt=attempts,
+            batch=batch,
+        )
+        self.progress_store.save(task.progress_path, progress)
+        self._emit_agent_progress(task, schema_definition, progress, runner, result)
+        return {
+            "progress": progress,
+            "needs_split": self._should_split_batch(batch),
+            "split_reason": result.reason or "segment retries exhausted",
+        }
+
+    def _agent_runner_for(
+        self,
+        task: TaskDefinition,
+        schema_definition: SchemaDefinition,
+    ) -> AgentRunner:
+        key = (str(task.epub_path), schema_definition.schema_name)
+        cached = self._agent_runners.get(key)
+        if cached is not None:
+            return cached
+
+        def log(message: str) -> None:
+            self._log(task, message)
+
+        runner = AgentRunner(
+            config=self.config,
+            task=task,
+            schema_definition=schema_definition,
+            model_client=self.model_client,
+            yaml_store=self.yaml_store,
+            logger=log,
+        )
+        self._agent_runners[key] = runner
+        return runner
+
+    def _agent_template_stub(self, task: TaskDefinition) -> PromptTemplate:
+        """会话模式不使用 prompt 模板，但 progress 的 prompt 字段仍需要一份占位。"""
+        path = task.workspace.root / "prompts" / "agent_system.md"
+        return PromptTemplate(name="agent", path=path, index=0, content="")
+
+    def _record_agent_observability(
+        self,
+        progress: dict[str, Any],
+        runner: AgentRunner,
+        batch: ChapterBatch,
+    ) -> None:
+        session = runner.session
+        session_meta = progress.setdefault("session", {})
+        session_meta.update(
+            {
+                "generation_id": session.generation_id,
+                "rotate_count": session.rotate_count,
+                "segments_completed": session.segments_completed,
+                "last_segment_end_chapter": session.last_segment_end_chapter,
+                "message_count": len(session.messages),
+            }
+        )
+        if self.config.cache.log_hit_tokens:
+            progress["cache"] = session.usage.to_progress_dict()
+        progress["agent"] = {
+            "mode": "agent",
+            "last_batch_range": batch.display_range,
+        }
+
+    def _emit_agent_progress(
+        self,
+        task: TaskDefinition,
+        schema_definition: SchemaDefinition,
+        progress: dict[str, Any],
+        runner: AgentRunner,
+        result: Any,
+    ) -> None:
+        if not self.config.emit_console_progress:
+            return
+        session = runner.session
+        usage = session.usage
+        last_batch = progress.get("agent", {}).get("last_batch_range", "")
+        status = "ok" if result.ok else "failed"
+        last_error = self._last_error(progress)
+        suffix = f" last_error={last_error}" if last_error else ""
+        print(
+            f"[{task.workspace.epub_name}][{schema_definition.schema_name}] "
+            f"{progress.get('last_completed_chapter_index', 0)}/{progress.get('total_chapters', 0)} "
+            f"batch={last_batch} status={status} edits={result.edit_count} rounds={result.tool_rounds} "
+            f"gen={session.generation_id} cache_hit={usage.cache_hit_tokens} "
+            f"cache_miss={usage.cache_miss_tokens} hit_ratio={usage.hit_ratio:.3f}{suffix}"
+        )
+
+    async def run_task(self, task: TaskDefinition) -> dict[str, Any]:
         state = self.prepare_task_state(task)
 
         while not state.is_completed and not state.is_failed:

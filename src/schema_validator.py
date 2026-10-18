@@ -63,8 +63,60 @@ class SchemaValidator:
         return node
 
     def validate_increment(self, data: dict[str, Any], schema_definition: SchemaDefinition) -> ValidationResult:
-        # TODO: JSON Schema validator
-        return ValidationResult(ok=True, errors=[])
+        """校验增量数据是否符合 schema 骨架。
+
+        校验三类错误：
+        - 顶层出现非预期 key（只允许 `root_key`）
+        - 条目 key 不符合 match_key 要求（空、空白、或非字符串）
+        - 条目出现 schema 之外的字段
+        """
+        errors: list[ValidationIssue] = []
+        if not isinstance(data, dict):
+            return ValidationResult(ok=False, errors=[ValidationIssue(path="$", reason="increment root must be mapping")])
+
+        root_key = schema_definition.root_key
+        for top_key in data:
+            if top_key != root_key:
+                errors.append(ValidationIssue(path=str(top_key), reason=f"unexpected top-level key, expected {root_key}"))
+
+        items = data.get(root_key)
+        if items is None:
+            return ValidationResult(ok=not errors, errors=errors)
+        if not isinstance(items, dict):
+            errors.append(ValidationIssue(path=root_key, reason="must be a mapping"))
+            return ValidationResult(ok=False, errors=errors)
+
+        skeleton = self._extract_item_skeleton(schema_definition)
+        for item_key, item_value in items.items():
+            item_path = f"{root_key}.{item_key}"
+            if self._is_missing_entry_key(item_key):
+                errors.append(
+                    ValidationIssue(path=item_path, reason=f"invalid entry key for match_key {schema_definition.match_key}")
+                )
+            if not isinstance(item_value, dict):
+                errors.append(ValidationIssue(path=item_path, reason="entry must be a mapping"))
+                continue
+            self._validate_against_skeleton(
+                node=item_value,
+                skeleton=skeleton,
+                path=item_path,
+                errors=errors,
+            )
+
+        return ValidationResult(ok=not errors, errors=errors)
+
+    def validate_node(
+        self,
+        node: Any,
+        *,
+        path: str,
+        schema_definition: SchemaDefinition,
+    ) -> ValidationResult:
+        """校验单个节点，供编辑工具在校验单项修改时复用。"""
+        errors: list[ValidationIssue] = []
+        skeleton = self._extract_item_skeleton(schema_definition)
+        self._validate_against_skeleton(node=node, skeleton=skeleton, path=path, errors=errors)
+        return ValidationResult(ok=not errors, errors=errors)
 
     def _extract_item_skeleton(self, schema_definition: SchemaDefinition) -> Any:
         root_value = schema_definition.raw_schema[schema_definition.root_key]
@@ -88,11 +140,24 @@ class SchemaValidator:
                 errors.append(ValidationIssue(path=path, reason="expected mapping"))
                 return
 
+            catch_all_key = self._find_placeholder_key(skeleton)
             for key, value in node.items():
-                if key not in skeleton:
+                if key in skeleton:
+                    child_skeleton = skeleton[key]
+                    child_path = f"{path}.{key}"
+                elif catch_all_key is not None:
+                    # 动态键（如 relationships 的 dynamic_with_<CharacterName>）
+                    child_skeleton = skeleton[catch_all_key]
+                    child_path = f"{path}.{key}"
+                else:
                     errors.append(ValidationIssue(path=f"{path}.{key}", reason="unexpected field"))
                     continue
-                self._validate_against_skeleton(node=value, skeleton=skeleton[key], path=f"{path}.{key}", errors=errors)
+                self._validate_against_skeleton(
+                    node=value,
+                    skeleton=child_skeleton,
+                    path=child_path,
+                    errors=errors,
+                )
             return
 
         if isinstance(skeleton, list):
@@ -107,6 +172,17 @@ class SchemaValidator:
             return
 
         return
+
+    def _find_placeholder_key(self, skeleton: dict[str, Any]) -> str | None:
+        """找出骨架中的占位符键（如 ``dynamic_with_<CharacterName>``）。
+
+        这类键表示「任意键名」，用于 relationships 这类动态映射。
+        仅当骨架里只有唯一一个占位符键时才当作通配，避免歧义。
+        """
+        placeholders = [key for key in skeleton if isinstance(key, str) and "<" in key and ">" in key]
+        if len(placeholders) == 1:
+            return placeholders[0]
+        return None
 
     def _sanitize_key(self, key: Any) -> Any:
         if isinstance(key, str):

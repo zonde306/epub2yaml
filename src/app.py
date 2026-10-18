@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 
 from checkpoint_store import CheckpointStore
-from models import AppConfig, BatchingConfig, MergeConfig, TaskDefinition
+from models import AppConfig, BatchingConfig, CacheConfig, MergeConfig, SessionConfig, TaskDefinition, ToolConfig
 from progress_store import ProgressStore
 from task_runner import TaskRunner
 from workspace_manager import WorkspaceManager
@@ -48,6 +48,10 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
     progress = raw.get("progress", {})
     batching = raw.get("batching", {})
     merge = raw.get("merge", {})
+    pipeline = raw.get("pipeline", {})
+    session_raw = raw.get("session", {})
+    tools_raw = raw.get("tools", {})
+    cache_raw = raw.get("cache", {})
 
     return AppConfig(
         input_epubs=input_epubs,
@@ -80,6 +84,24 @@ def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> AppConfig:
         merge=MergeConfig(
             similarity_threshold=float(merge.get("similarity_threshold", 0.6)),
             field_weights=dict(merge.get("field_weights", {})),
+        ),
+        pipeline_mode=str(pipeline.get("mode", "legacy")),
+        session=SessionConfig(
+            enabled=bool(session_raw.get("enabled", True)),
+            max_context_tokens=int(session_raw.get("max_context_tokens", 64000)),
+            max_tool_rounds_per_segment=int(session_raw.get("max_tool_rounds_per_segment", 12)),
+            rotate_on_checkpoint=bool(session_raw.get("rotate_on_checkpoint", True)),
+            persist_messages=bool(session_raw.get("persist_messages", True)),
+            index_detail=str(session_raw.get("index_detail", "compact")),
+        ),
+        tools=ToolConfig(
+            allow_remove=bool(tools_raw.get("allow_remove", False)),
+            allow_full_write=bool(tools_raw.get("allow_full_write", False)),
+            near_duplicate_check=bool(tools_raw.get("near_duplicate_check", True)),
+        ),
+        cache=CacheConfig(
+            mode=str(cache_raw.get("mode", "implicit")),
+            log_hit_tokens=bool(cache_raw.get("log_hit_tokens", True)),
         ),
     )
 
@@ -141,6 +163,26 @@ def default_raw_config() -> dict[str, Any]:
             "checkpoint_every_n_chapters": 10,
         },
         "blacklist_keywords": [],
+        "pipeline": {
+            "mode": "legacy",
+        },
+        "session": {
+            "enabled": True,
+            "max_context_tokens": 64000,
+            "max_tool_rounds_per_segment": 12,
+            "rotate_on_checkpoint": True,
+            "persist_messages": True,
+            "index_detail": "compact",
+        },
+        "tools": {
+            "allow_remove": False,
+            "allow_full_write": False,
+            "near_duplicate_check": True,
+        },
+        "cache": {
+            "mode": "implicit",
+            "log_hit_tokens": True,
+        },
         "merge": {
             "similarity_threshold": 0.6,
             "field_weights": {},
@@ -183,10 +225,17 @@ def add_epub_command(config_path: Path, epub_source: Path) -> int:
     return 0
 
 
-async def run_command_async(config_path: Path = DEFAULT_CONFIG_PATH) -> int:
-    """异步执行任务的主函数。"""
+async def run_command_async(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    *,
+    model_client: Any = None,
+) -> int:
+    """异步执行任务的主函数。
+
+    ``model_client`` 仅用于测试注入，生产路径不传即按配置构建。
+    """
     config = load_config(config_path)
-    runner = TaskRunner(config)
+    runner = TaskRunner(config, model_client=model_client) if model_client is not None else TaskRunner(config)
     tasks = runner.build_tasks()
 
     if not tasks:

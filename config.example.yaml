@@ -33,6 +33,43 @@ batching:
   split_after_retry_exhausted: true
   enable_checkpoint: false
   checkpoint_every_n_chapters: 10
+
+# 抽取管线模式
+#   legacy: 让 LLM 输出完整 YAML，由程序侧合并（旧行为，未设置时的默认值）
+#   agent : 提供编辑工具，由 LLM 逐字段修改 output.yaml（推荐，见下）
+pipeline:
+  mode: legacy
+
+# 会话式抽取配置（仅在 pipeline.mode=agent 时生效）
+session:
+  enabled: true
+  # 上下文预算，超过后开启新一轮 generation（0 或负数表示不旋转）
+  max_context_tokens: 64000
+  # 单个段落允许的最大工具调用轮数，超过即视为段落失败
+  max_tool_rounds_per_segment: 12
+  # 旋转点与 checkpoint 窗口对齐（超出硬上限时会立即旋转）
+  rotate_on_checkpoint: true
+  # 把消息时间线落盘，支持崩溃后恢复
+  persist_messages: true
+  # 实体索引摘要粒度: compact | full
+  index_detail: compact
+
+# 编辑工具开关
+tools:
+  # 是否允许 remove_field / remove_entry（默认隐藏，避免误删）
+  allow_remove: false
+  # 是否允许整体覆写文件（默认关闭：一旦开启就会退回「输出全文」）
+  allow_full_write: false
+  # 新建条目前的近似重名检查
+  near_duplicate_check: true
+
+# 提示缓存配置
+cache:
+  # implicit: DeepSeek / OpenAI 自动前缀缓存
+  # explicit: Anthropic 显式 cache_control 断点
+  mode: implicit
+  # 是否把 cache hit/miss token 数写入 progress
+  log_hit_tokens: true
 # 黑名单关键字列表：如果LLM输出包含这些关键字，则视为错误并触发重试
 blacklist_keywords: []
 # blacklist_keywords:

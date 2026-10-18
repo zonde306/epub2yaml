@@ -40,7 +40,11 @@
 - `src/yaml_store.py`：输出 YAML 初始化、读取与增量合并
 - `src/progress_store.py`：任务进度文件持久化
 - `src/workspace_manager.py`：工作区创建与路径管理
-- `src/llm_client.py`：流式模型客户端实现
+- `src/llm_client.py`：流式模型客户端实现（含工具调用与缓存用量提取）
+- `src/edit_tools.py`：会话模式的编辑工具集（路径解析、去重、原子写与 journal）
+- `src/session.py`：会话消息时间线（append-only、上下文旋转、落盘恢复）
+- `src/index_builder.py`：实体索引摘要与进度水位生成
+- `src/agent_runner.py`：会话式抽取的段落循环驱动
 
 ---
 
@@ -86,7 +90,9 @@ pip install pyyaml lxml httpx
 - OpenAI-compatible 流式 API 接入
 - 命令行初始化 / 添加输入 / 运行 / 恢复 / 测试
 - checkpoint 自动保存与手动恢复
-- 单元测试
+- 会话式（agent）抽取：编辑工具、append-only 会话、上下文旋转、缓存用量观测
+- 确定性 skeleton 校验（字段、类型、动态键通配）
+- 单元测试（211 项）
 
 ### 尚未实现 / 仍待增强
 
@@ -94,6 +100,7 @@ pip install pyyaml lxml httpx
 - 更强 schema 注释保留与注释驱动校验
 - 更完整的错误分类与观测能力
 - 更丰富的多提供方适配
+- Anthropic 显式缓存断点（`cache.mode: explicit` 已预留配置，客户端尚未实现）
 
 如果 `config.yaml` 中 `model.api_key` 为空，系统会退回到 `src/llm_client.py` 中的占位客户端，仅返回空增量 YAML，用于本地打通流程。
 
@@ -203,6 +210,44 @@ batching:
 
 #### `batching.checkpoint_every_n_chapters`
 checkpoint 窗口大小，同时决定自动保存边界。例如设置为 `10` 时，处理到第 10、20、30 章会自动保存；最后一段不足 10 章时也会在任务结束时保存。
+
+#### `pipeline.mode`
+抽取管线模式，可选 `legacy` 或 `agent`。未设置时默认 `legacy`，行为与改造前完全一致。
+
+- `legacy`：LLM 直接输出完整 YAML，由程序侧合并。输出容易撞 `max_tokens`，且每批都要重发 schema 与已有结果，前缀缓存无法命中。
+- `agent`：LLM 不再输出 YAML，而是通过编辑工具（`upsert_entry` / `set_fields` / `append_items` 等）逐处修改 `output.yaml`。
+
+`agent` 模式的两个关键收益：
+
+1. 单次回复只需携带工具参数，不再重述完整节点，输出长度大幅下降
+2. 消息时间线 append-only，schema 只在会话开头出现一次，可稳定命中前缀缓存
+
+#### `session.max_context_tokens`
+上下文预算。累计 prompt token 超过该值后，会话开启新一轮 generation：保留不变的 system 块（人设与 schema），重建实体索引摘要与进度水位。设置为 `0` 或负数表示不旋转，仅适合短文本调试。
+
+#### `session.max_tool_rounds_per_segment`
+单个段落允许的最大工具调用轮数。超过该值即视为段落失败，不会推进 `last_completed_chapter_index`。
+
+#### `session.rotate_on_checkpoint`
+是否让上下文旋转与 checkpoint 窗口对齐。对齐后旋转点可复现、可回滚；若 token 数超过硬上限（预算的 1.5 倍）则立即旋转，不再等待边界。
+
+#### `session.persist_messages`
+是否把消息时间线写入 `session/<schema>/messages.jsonl`。开启后崩溃可恢复；恢复失败时会按进度水位重开会话。
+
+#### `session.index_detail`
+实体索引摘要粒度，可选 `compact` 或 `full`。摘要只包含条目 key 与一行描述，且在同一 generation 内保持不变——跨段重算会让 prompt 前缀抖动，直接破坏缓存命中。
+
+#### `tools.allow_remove`
+是否向模型暴露 `remove_field` / `remove_entry`。默认 `false`，即这两个工具不出现在工具列表中。
+
+#### `tools.near_duplicate_check`
+新建条目前的近似重名检查。开启时，若新 key 与已有 key 的相似度超过 `merge.similarity_threshold`，工具会拒绝创建并返回候选 key 列表，避免同一实体产生多个条目。
+
+#### `cache.mode`
+缓存模式。`implicit` 适用于 DeepSeek 与 OpenAI（自动前缀匹配）；`explicit` 适用于 Anthropic 系（需要显式 `cache_control` 断点）。该开关必须由配置决定，不能写死在客户端里。
+
+#### `cache.log_hit_tokens`
+是否把命中数据写入 `state/<schema>.progress.yaml` 的 `cache` 字段，包含 `cache_hit_tokens`、`cache_miss_tokens` 与 `hit_ratio`。命中率只用于观测，不参与正确性判定——DeepSeek 官方明确说明前缀缓存是 best-effort。
 
 ---
 

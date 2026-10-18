@@ -179,11 +179,11 @@ def build_raw_schema_from_fields(root_key: str, fields: list[SchemaField]) -> di
                 continue
 
             if next_is_list:
-                if key not in current or not isinstance(current[key], list):
-                    current[key] = [{}]
-                if not current[key] or not isinstance(current[key][0], dict):
-                    current[key] = [{}]
-                current = current[key][0]
+                # `next_part` 形如 `outfits[]`：list 属于下一段，
+                # 当前 key 本身仍是对象容器，不能把它换成 list。
+                if key not in current or not isinstance(current[key], dict):
+                    current[key] = {}
+                current = current[key]
             else:
                 if key not in current or not isinstance(current[key], dict):
                     current[key] = {}

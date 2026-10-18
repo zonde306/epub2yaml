@@ -1,0 +1,7 @@
+[tool.pyright]
+include = ["src", "tests"]
+exclude = ["**/__pycache__", "workspace"]
+extraPaths = ["src"]
+pythonVersion = "3.10"
+typeCheckingMode = "basic"
+reportMissingImports = "warning"
