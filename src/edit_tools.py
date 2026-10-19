@@ -362,6 +362,18 @@ def _flatten_summary_text(value: Any) -> str:
     return ""
 
 
+@dataclass(slots=True)
+class _EditTransaction:
+    """在内存中暂存编辑；校验全部通过后才提交文档与日志。"""
+
+    document: dict[str, Any]
+    journal: list[dict[str, Any]] = field(default_factory=list)
+
+    def record(self, **record: Any) -> None:
+        # 后续操作可能再次修改同一节点，日志必须保留操作发生时的快照。
+        self.journal.append(copy.deepcopy(record))
+
+
 class EditTools:
     """作用于单个任务 ``output.yaml`` 的结构化编辑工具集。"""
 
@@ -396,6 +408,46 @@ class EditTools:
         schemas = [copy.deepcopy(item) for item in TOOL_SCHEMAS]
         if self.allow_remove:
             schemas.extend(copy.deepcopy(item) for item in REMOTE_TOOL_SCHEMAS)
+        edit_names = [
+            item["function"]["name"] for item in schemas
+            if item["function"]["name"] not in ("read_entry", "list_entries")
+        ]
+        schemas.append({
+            "type": "function",
+            "function": {
+                "name": "batch_edit",
+                "description": (
+                    "优先使用此工具一次提交多个条目、多个字段的编辑，减少模型往返轮数。"
+                    "operations 按顺序执行，后项可依赖前项；参数与对应单项工具相同。"
+                    "全部校验通过才统一写入，任一操作失败则整批不写入；"
+                    "修正 failed_index（从 0 开始）处的错误后重发完整批次。"
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "operations": {
+                            "type": "array",
+                            "minItems": 1,
+                            "description": "按执行顺序排列的编辑操作，支持跨条目混合新建、字段修改和数组追加",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "tool": {"type": "string", "enum": edit_names},
+                                    "arguments": {
+                                        "type": "object",
+                                        "description": "对应单项工具的参数对象，例如 set_fields 使用 key、path、value",
+                                    },
+                                },
+                                "required": ["tool", "arguments"],
+                                "additionalProperties": False,
+                            },
+                        },
+                    },
+                    "required": ["operations"],
+                    "additionalProperties": False,
+                },
+            },
+        })
         return schemas
 
     def tool_names(self) -> set[str]:
@@ -441,24 +493,80 @@ class EditTools:
     # -------------------------------------------------------------- 工具分发
 
     def dispatch(self, tool_name: str, arguments: dict[str, Any]) -> EditOutcome:
-        """执行一次工具调用。返回结果即为 ``tool_result`` 内容，失败时不修改文件。"""
+        """执行一次工具调用。单项与批量编辑均在校验通过后提交，失败时不修改文件。"""
+        try:
+            if tool_name == "read_entry":
+                return self._op_read_entry(arguments)
+            if tool_name == "list_entries":
+                return self._op_list_entries(arguments)
+            if tool_name == "batch_edit":
+                operations = arguments.get("operations")
+                if not isinstance(operations, list) or not operations:
+                    return EditOutcome(
+                        ok=False, code="bad_operations", reason="operations 必须是非空数组",
+                        extra={"edit_count": 0},
+                    )
+                return self._apply_edits(operations, batch=True)
+            return self._apply_edits([{"tool": tool_name, "arguments": arguments}], batch=False)
+        except PathError as exc:
+            return EditOutcome(ok=False, code="bad_path", reason=str(exc))
+
+    def _apply_edits(self, operations: list[Any], *, batch: bool) -> EditOutcome:
         handlers = {
-            "read_entry": self._op_read_entry,
-            "list_entries": self._op_list_entries,
             "upsert_entry": self._op_upsert_entry,
             "set_fields": self._op_set_fields,
             "append_items": self._op_append_items,
             "remove_field": self._op_remove_field,
             "remove_entry": self._op_remove_entry,
         }
-        handler = handlers.get(tool_name)
-        if handler is None:
-            available = ", ".join(sorted(handlers))
-            return EditOutcome(ok=False, code="unknown_tool", reason=f"未知工具: {tool_name}", extra={"available_tools": available})
-        try:
-            return handler(arguments)
-        except PathError as exc:
-            return EditOutcome(ok=False, code="bad_path", reason=str(exc))
+        transaction = _EditTransaction(self.load_document())
+        results: list[dict[str, Any]] = []
+        outcome = EditOutcome(ok=True)
+        for index, operation in enumerate(operations):
+            tool_name = operation.get("tool") if isinstance(operation, dict) else None
+            arguments = operation.get("arguments") if isinstance(operation, dict) else None
+            if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+                outcome = EditOutcome(
+                    ok=False, code="bad_arguments",
+                    reason="每项操作必须包含字符串 tool 和对象 arguments",
+                )
+            elif tool_name not in handlers:
+                available = self.tool_names()
+                if batch:
+                    available.intersection_update(handlers)
+                outcome = EditOutcome(
+                    ok=False, code="unknown_tool", reason=f"未知编辑工具: {tool_name}",
+                    extra={"available_tools": ", ".join(sorted(available))},
+                )
+            else:
+                try:
+                    outcome = handlers[tool_name](copy.deepcopy(arguments), transaction)
+                except PathError as exc:
+                    outcome = EditOutcome(ok=False, code="bad_path", reason=str(exc))
+
+            if not outcome.ok:
+                if not batch:
+                    return outcome
+                return EditOutcome(
+                    ok=False, code="batch_failed",
+                    reason=f"operations[{index}] 失败，整批未写入: {outcome.reason}",
+                    extra={
+                        "failed_index": index,
+                        "tool": tool_name,
+                        "operation_error": outcome.to_payload()["error"],
+                        "edit_count": 0,
+                        "hint": "本批次没有任何编辑生效；修正错误后重发完整 operations，不要只重发失败项",
+                    },
+                )
+            results.append({"index": index, "tool": tool_name, **copy.deepcopy(outcome.to_payload())})
+
+        if transaction.journal:
+            self.write_document(transaction.document)
+            for record in transaction.journal:
+                self._append_journal(**record)
+        if batch:
+            return EditOutcome(ok=True).add(edit_count=len(operations), results=results)
+        return outcome
 
     # -------------------------------------------------------------- 各工具实现
 
@@ -476,13 +584,13 @@ class EditTools:
         entries = self.list_entries(limit=limit)
         return EditOutcome(ok=True).add(count=len(entries), entries=entries)
 
-    def _op_upsert_entry(self, arguments: dict[str, Any]) -> EditOutcome:
+    def _op_upsert_entry(self, arguments: dict[str, Any], transaction: _EditTransaction) -> EditOutcome:
         key = self._require_key(arguments)
         node = arguments.get("node")
         if not isinstance(node, dict):
             return EditOutcome(ok=False, code="bad_node", reason="node 必须是对象映射", extra={"expected": "object"})
 
-        document = self.load_document()
+        document = transaction.document
         entries = self._entries(document)
         existing = key in entries
 
@@ -513,8 +621,7 @@ class EditTools:
 
         before = entries.get(key)
         document[self.schema_definition.root_key][key] = merged_node
-        self.write_document(document)
-        self._append_journal(
+        transaction.record(
             op="upsert_entry",
             key=key,
             before=before,
@@ -528,14 +635,14 @@ class EditTools:
             entry_keys=sorted(merged_node.keys()),
         )
 
-    def _op_set_fields(self, arguments: dict[str, Any]) -> EditOutcome:
+    def _op_set_fields(self, arguments: dict[str, Any], transaction: _EditTransaction) -> EditOutcome:
         key = self._require_key(arguments)
         raw_path = str(arguments.get("path", "") or "")
         if "value" not in arguments:
             return EditOutcome(ok=False, code="missing_value", reason="缺少 value 参数")
         value = arguments.get("value")
 
-        document = self.load_document()
+        document = transaction.document
         entries = self._entries(document)
         if key not in entries:
             return EditOutcome(
@@ -575,11 +682,10 @@ class EditTools:
             return validation
 
         self._assign_path(entry, parse_field_path(raw_path), value)
-        self.write_document(document)
-        self._append_journal(op="set_fields", key=key, path=raw_path, before=previous, after=value)
+        transaction.record(op="set_fields", key=key, path=raw_path, before=previous, after=value)
         return EditOutcome(ok=True).add(key=key, path=raw_path, value=value)
 
-    def _op_append_items(self, arguments: dict[str, Any]) -> EditOutcome:
+    def _op_append_items(self, arguments: dict[str, Any], transaction: _EditTransaction) -> EditOutcome:
         key = self._require_key(arguments)
         raw_path = str(arguments.get("path", "") or "")
         items = arguments.get("items")
@@ -589,7 +695,7 @@ class EditTools:
         if not isinstance(items, list) or not items:
             return EditOutcome(ok=False, code="bad_items", reason="items 必须是非空数组")
 
-        document = self.load_document()
+        document = transaction.document
         entries = self._entries(document)
         if key not in entries:
             return EditOutcome(
@@ -641,16 +747,15 @@ class EditTools:
         if not validation.ok:
             return validation
 
-        self.write_document(document)
-        self._append_journal(op="append_items", key=key, path=raw_path, appended=appended, duplicates=duplicates)
+        transaction.record(op="append_items", key=key, path=raw_path, appended=appended, duplicates=duplicates)
         return EditOutcome(ok=True).add(key=key, path=raw_path, appended=appended, duplicates=duplicates, length=len(target))
 
-    def _op_remove_field(self, arguments: dict[str, Any]) -> EditOutcome:
+    def _op_remove_field(self, arguments: dict[str, Any], transaction: _EditTransaction) -> EditOutcome:
         if not self.allow_remove:
             return EditOutcome(ok=False, code="remove_disabled", reason="删除操作未启用（tools.allow_remove=false）")
         key = self._require_key(arguments)
         raw_path = str(arguments.get("path", "") or "")
-        document = self.load_document()
+        document = transaction.document
         entries = self._entries(document)
         if key not in entries:
             return EditOutcome(ok=False, code="unknown_entry", reason=f"条目不存在: {key}")
@@ -660,21 +765,19 @@ class EditTools:
         validation = self._validate_entry(key, entries[key])
         if not validation.ok:
             return validation
-        self.write_document(document)
-        self._append_journal(op="remove_field", key=key, path=raw_path, before=previous)
+        transaction.record(op="remove_field", key=key, path=raw_path, before=previous)
         return EditOutcome(ok=True).add(key=key, path=raw_path)
 
-    def _op_remove_entry(self, arguments: dict[str, Any]) -> EditOutcome:
+    def _op_remove_entry(self, arguments: dict[str, Any], transaction: _EditTransaction) -> EditOutcome:
         if not self.allow_remove:
             return EditOutcome(ok=False, code="remove_disabled", reason="删除操作未启用（tools.allow_remove=false）")
         key = self._require_key(arguments)
-        document = self.load_document()
+        document = transaction.document
         entries = self._entries(document)
         if key not in entries:
             return EditOutcome(ok=False, code="unknown_entry", reason=f"条目不存在: {key}")
         before = entries.pop(key)
-        self.write_document(document)
-        self._append_journal(op="remove_entry", key=key, before=before)
+        transaction.record(op="remove_entry", key=key, before=before)
         return EditOutcome(ok=True).add(key=key)
 
     # ------------------------------------------------------------------ 校验

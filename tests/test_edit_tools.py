@@ -5,6 +5,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -40,6 +42,10 @@ def minimal_node() -> dict:
         "trigger_keywords": ["爱丽丝"],
         "basic_settings": {"gender": "Female", "race": "Human", "age": 19, "identity": ["学生"]},
     }
+
+def edit_operation(tool: str, **arguments: Any) -> dict[str, Any]:
+    return {"tool": tool, "arguments": arguments}
+
 
 class ParseFieldPathTests(unittest.TestCase):
     def test_parses_dotted_path(self) -> None:
@@ -558,6 +564,278 @@ class EditToolsAppendTests(unittest.TestCase):
 
             self.assertFalse(outcome.ok)
             self.assertEqual(outcome.code, "bad_mode")
+
+class EditToolsBatchTests(unittest.TestCase):
+    def test_batch_schema_lists_only_enabled_edit_tools(self) -> None:
+        for allow_remove in (False, True):
+            with self.subTest(allow_remove=allow_remove), tempfile.TemporaryDirectory() as temp_dir:
+                tools, _, _ = build_tools(temp_dir, allow_remove=allow_remove)
+                schemas = tools.tool_schemas()
+                batch = next(item["function"] for item in schemas if item["function"]["name"] == "batch_edit")
+                operations = batch["parameters"]["properties"]["operations"]
+                names = operations["items"]["properties"]["tool"]["enum"]
+                expected = {"upsert_entry", "set_fields", "append_items"}
+                if allow_remove:
+                    expected.update({"remove_field", "remove_entry"})
+
+                self.assertEqual(set(names), expected)
+                self.assertEqual(operations["minItems"], 1)
+                self.assertIn("batch_edit", tools.tool_names())
+                self.assertIn("batch_edit", json.dumps(schemas))
+                names.append("read_entry")
+                fresh = next(item["function"] for item in tools.tool_schemas() if item["function"]["name"] == "batch_edit")
+                self.assertNotIn("read_entry", fresh["parameters"]["properties"]["operations"]["items"]["properties"]["tool"]["enum"])
+
+    def test_mixed_operations_share_one_read_and_atomic_write(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            operations = [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("upsert_entry", key="Bob", node={"name": {"romaji": "Bob"}, "trigger_keywords": ["Bob"]}),
+                edit_operation("set_fields", key="Alice", path="basic_settings.age", value=20),
+                edit_operation("append_items", key="Alice", path="trigger_keywords", items=["爱丽丝", "アリス"]),
+                edit_operation("upsert_entry", key="Bob", node={"basic_settings": {"age": 30, "gender": "Male"}}),
+                edit_operation("set_fields", key="Bob", path="basic_settings.age", value=31),
+                edit_operation("append_items", key="Alice", path="appearance.outfits", items=[{"outfit_type": "school", "description": "a"}]),
+                edit_operation("set_fields", key="Alice", path="appearance.outfits[0].description", value="b"),
+            ]
+            with patch.object(tools, "load_document", wraps=tools.load_document) as load, \
+                    patch.object(tools, "write_document", wraps=tools.write_document) as write:
+                outcome = tools.dispatch("batch_edit", {"operations": operations})
+
+                load.assert_called_once_with()
+                write.assert_called_once()
+            self.assertTrue(outcome.ok, outcome.to_payload())
+            self.assertEqual(outcome.extra["edit_count"], len(operations))
+            self.assertEqual([item["index"] for item in outcome.extra["results"]], list(range(len(operations))))
+            self.assertTrue(all(item["ok"] for item in outcome.extra["results"]))
+            self.assertEqual(outcome.extra["results"][3]["duplicates"], 1)
+            stored = YamlStore().load_yaml(output_path)["actors"]
+            self.assertEqual(stored["Alice"]["basic_settings"]["age"], 20)
+            self.assertEqual(stored["Alice"]["basic_settings"]["gender"], "Female")
+            self.assertEqual(stored["Alice"]["trigger_keywords"], ["爱丽丝", "アリス"])
+            self.assertEqual(stored["Alice"]["appearance"]["outfits"][0]["description"], "b")
+            self.assertEqual(stored["Bob"]["basic_settings"]["age"], 31)
+            records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([record["op"] for record in records], [operation["tool"] for operation in operations])
+            self.assertFalse(output_path.with_name(f".{output_path.name}.tmp").exists())
+
+    def test_journal_results_and_arguments_preserve_per_operation_snapshots(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, _, journal_path = build_tools(temp_dir)
+            operations = [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("upsert_entry", key="Alice", node={"basic_settings": {"age": 20}}),
+                edit_operation("set_fields", key="Alice", path="basic_settings.age", value=21),
+                edit_operation("set_fields", key="Alice", path="trigger_keywords", value=["Alice"]),
+                edit_operation("append_items", key="Alice", path="trigger_keywords", items=["アリス"]),
+            ]
+            original_arguments = json.dumps(operations, ensure_ascii=False)
+
+            outcome = tools.dispatch("batch_edit", {"operations": operations})
+
+            self.assertTrue(outcome.ok, outcome.to_payload())
+            records = [json.loads(line) for line in journal_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(records[0]["after"]["basic_settings"]["age"], 19)
+            self.assertEqual(records[1]["before"]["basic_settings"]["age"], 19)
+            self.assertEqual(records[1]["after"]["basic_settings"]["age"], 20)
+            self.assertEqual(records[2]["before"], 20)
+            self.assertEqual(records[3]["after"], ["Alice"])
+            self.assertEqual(outcome.extra["results"][3]["value"], ["Alice"])
+            self.assertEqual(json.dumps(operations, ensure_ascii=False), original_arguments)
+
+    def test_rejects_missing_empty_or_non_array_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+            for arguments in ({}, {"operations": []}, {"operations": {}}, {"operations": None}, {"operations": "bad"}):
+                with self.subTest(arguments=arguments):
+                    outcome = tools.dispatch("batch_edit", arguments)
+
+                    self.assertFalse(outcome.ok)
+                    self.assertEqual(outcome.code, "bad_operations")
+                    self.assertEqual(outcome.extra["edit_count"], 0)
+                    self.assertEqual(output_path.read_bytes(), before)
+                    self.assertFalse(journal_path.exists())
+
+    def test_malformed_operation_rolls_back_earlier_edits(self) -> None:
+        invalid_operations = [
+            None, [], "bad", 42, {}, {"tool": "upsert_entry"},
+            {"tool": [], "arguments": {}}, {"tool": "set_fields", "arguments": "{}"},
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+            for invalid in invalid_operations:
+                with self.subTest(operation=invalid):
+                    outcome = tools.dispatch("batch_edit", {"operations": [
+                        edit_operation("upsert_entry", key="Alice", node=minimal_node()), invalid,
+                    ]})
+
+                    self.assertFalse(outcome.ok)
+                    self.assertEqual(outcome.code, "batch_failed")
+                    self.assertEqual(outcome.extra["failed_index"], 1)
+                    self.assertEqual(outcome.extra["operation_error"]["code"], "bad_arguments")
+                    self.assertEqual(output_path.read_bytes(), before)
+                    self.assertFalse(journal_path.exists())
+
+    def test_rejects_read_tools_unknown_tools_and_nested_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+            for tool_name in ("read_entry", "list_entries", "batch_edit", "no_such_tool"):
+                with self.subTest(tool=tool_name):
+                    outcome = tools.dispatch("batch_edit", {"operations": [
+                        edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                        edit_operation(tool_name, key="Alice"),
+                    ]})
+
+                    self.assertFalse(outcome.ok)
+                    error = outcome.extra["operation_error"]
+                    self.assertEqual(error["code"], "unknown_tool")
+                    self.assertNotIn("batch_edit", error["available_tools"])
+                    self.assertEqual(output_path.read_bytes(), before)
+                    self.assertFalse(journal_path.exists())
+
+    def test_failed_batch_keeps_existing_document_and_journal_then_can_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            tools.dispatch("upsert_entry", {"key": "Alice", "node": minimal_node()})
+            before = output_path.read_bytes(), journal_path.read_bytes()
+            operations = [
+                edit_operation("set_fields", key="Alice", path="basic_settings.age", value=20),
+                edit_operation("upsert_entry", key="Bob", node={**minimal_node(), "bogus_field": "x"}),
+                edit_operation("append_items", key="Alice", path="trigger_keywords", items=["アリス"]),
+            ]
+            with patch.object(tools, "write_document", wraps=tools.write_document) as write:
+                outcome = tools.dispatch("batch_edit", {"operations": operations})
+                write.assert_not_called()
+
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.extra["failed_index"], 1)
+            self.assertEqual(outcome.extra["tool"], "upsert_entry")
+            self.assertEqual(outcome.extra["operation_error"]["code"], "schema_violation")
+            self.assertEqual(outcome.extra["edit_count"], 0)
+            self.assertEqual((output_path.read_bytes(), journal_path.read_bytes()), before)
+            operations[1]["arguments"]["node"].pop("bogus_field")
+
+            retried = tools.dispatch("batch_edit", {"operations": operations})
+
+            self.assertTrue(retried.ok, retried.to_payload())
+            self.assertEqual(retried.extra["edit_count"], 3)
+            stored = YamlStore().load_yaml(output_path)["actors"]
+            self.assertEqual(stored["Alice"]["basic_settings"]["age"], 20)
+            self.assertIn("Bob", stored)
+            self.assertEqual(len(journal_path.read_text(encoding="utf-8").splitlines()), 4)
+
+    def test_path_error_retains_failed_index_without_creating_output(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            output_path.unlink()
+
+            outcome = tools.dispatch("batch_edit", {"operations": [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("set_fields", key="Alice", path="basic_settings[", value=20),
+            ]})
+
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.extra["failed_index"], 1)
+            self.assertEqual(outcome.extra["operation_error"]["code"], "bad_path")
+            self.assertFalse(output_path.exists())
+            self.assertFalse(journal_path.exists())
+
+    def test_near_duplicate_check_sees_earlier_operations(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+
+            outcome = tools.dispatch("batch_edit", {"operations": [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("upsert_entry", key="Alicia", node=minimal_node()),
+            ]})
+
+            self.assertFalse(outcome.ok)
+            error = outcome.extra["operation_error"]
+            self.assertEqual(error["code"], "near_duplicate_key")
+            self.assertEqual(error["candidates"][0]["key"], "Alice")
+            self.assertEqual(output_path.read_bytes(), before)
+            self.assertFalse(journal_path.exists())
+
+    def test_batch_preserves_forbidden_value_checks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+
+            outcome = tools.dispatch("batch_edit", {"operations": [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("set_fields", key="Alice", path="basic_settings.gender", value="未知"),
+            ]})
+
+            self.assertFalse(outcome.ok)
+            self.assertEqual(outcome.extra["operation_error"]["code"], "forbidden_value")
+            self.assertEqual(output_path.read_bytes(), before)
+            self.assertFalse(journal_path.exists())
+
+    def test_batch_remove_still_requires_opt_in(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+            for tool_name in ("remove_field", "remove_entry"):
+                with self.subTest(tool=tool_name):
+                    outcome = tools.dispatch("batch_edit", {"operations": [
+                        edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                        edit_operation(tool_name, key="Alice", path="basic_settings.age"),
+                    ]})
+
+                    self.assertFalse(outcome.ok)
+                    self.assertEqual(outcome.extra["operation_error"]["code"], "remove_disabled")
+                    self.assertEqual(output_path.read_bytes(), before)
+                    self.assertFalse(journal_path.exists())
+
+    def test_batch_can_remove_fields_and_entries_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, _ = build_tools(temp_dir, allow_remove=True)
+
+            outcome = tools.dispatch("batch_edit", {"operations": [
+                edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                edit_operation("upsert_entry", key="Bob", node=minimal_node()),
+                edit_operation("remove_field", key="Alice", path="basic_settings.age"),
+                edit_operation("remove_entry", key="Bob"),
+            ]})
+
+            self.assertTrue(outcome.ok, outcome.to_payload())
+            stored = YamlStore().load_yaml(output_path)["actors"]
+            self.assertNotIn("age", stored["Alice"]["basic_settings"])
+            self.assertNotIn("Bob", stored)
+            self.assertEqual(outcome.extra["edit_count"], 4)
+
+    def test_duplicate_only_batch_keeps_existing_noop_semantics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            tools.dispatch("upsert_entry", {"key": "Alice", "node": minimal_node()})
+            before = output_path.read_bytes(), journal_path.read_bytes()
+            with patch.object(tools, "write_document", wraps=tools.write_document) as write:
+                outcome = tools.dispatch("batch_edit", {"operations": [
+                    edit_operation("append_items", key="Alice", path="trigger_keywords", items=["爱丽丝"]),
+                ]})
+                write.assert_not_called()
+
+            self.assertTrue(outcome.ok)
+            self.assertEqual(outcome.extra["results"][0]["appended"], 0)
+            self.assertEqual((output_path.read_bytes(), journal_path.read_bytes()), before)
+
+    def test_write_failure_does_not_publish_journal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            tools, output_path, journal_path = build_tools(temp_dir)
+            before = output_path.read_bytes()
+            with patch.object(tools, "write_document", side_effect=OSError("write failed")), self.assertRaises(OSError):
+                tools.dispatch("batch_edit", {"operations": [
+                    edit_operation("upsert_entry", key="Alice", node=minimal_node()),
+                ]})
+
+            self.assertEqual(output_path.read_bytes(), before)
+            self.assertFalse(journal_path.exists())
+
 
 class EditToolsReadTests(unittest.TestCase):
     def test_reads_entry_and_field(self) -> None:

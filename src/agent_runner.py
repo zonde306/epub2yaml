@@ -58,8 +58,11 @@ def build_persona_text(schema_definition: SchemaDefinition, *, extra_rules: str 
         "## 工作方式",
         "",
         "- 每轮你会收到一段连续章节原文",
-        "- 使用 upsert_entry / set_fields / append_items 等工具写入结果",
-        "- 写入前建议先用 read_entry 确认现有内容，避免覆盖已有信息",
+        "- 优先使用 batch_edit，把本段多个条目、多个字段的编辑合并到一次工具调用，减少往返轮数",
+        "- batch_edit 的 operations 按顺序执行，每项包含 tool 和 arguments；参数与 upsert_entry / set_fields / append_items 相同",
+        "- 批量操作全部校验通过才生效；失败时整批未写入，应修正 failed_index 处的错误后重发完整批次",
+        "- 单处修改仍可直接使用 upsert_entry / set_fields / append_items",
+        "- 写入前按需用 read_entry 确认现有内容，避免覆盖已有信息；已确认的内容不必重复读取",
         "- 一段处理完成后，停止调用工具并简短回复「本段完成」",
         "",
         "## 硬性要求",
@@ -240,7 +243,7 @@ class AgentRunner:
                 self.session.append_tool_result(tool_call_id=call.id, payload=outcome.to_payload())
                 if outcome.ok:
                     if call.name != "read_entry" and call.name != "list_entries":
-                        edit_count += 1
+                        edit_count += outcome.extra["edit_count"] if call.name == "batch_edit" else 1
                 else:
                     error_count += 1
 

@@ -261,18 +261,39 @@ checkpoint 窗口大小，同时决定自动保存边界。例如设置为 `10` 
 抽取管线模式，可选 `legacy` 或 `agent`。未设置时默认 `legacy`，行为与改造前完全一致。
 
 - `legacy`：LLM 直接输出完整 YAML，由程序侧合并。输出容易撞 `max_tokens`，且每批都要重发 schema 与已有结果，前缀缓存无法命中。
-- `agent`：LLM 不再输出 YAML，而是通过编辑工具（`upsert_entry` / `set_fields` / `append_items` 等）逐处修改 `output.yaml`。
+- `agent`：LLM 不再输出 YAML，而是优先通过 `batch_edit` 批量修改 `output.yaml`，也保留 `upsert_entry` / `set_fields` / `append_items` 等单项工具。
 
 `agent` 模式的两个关键收益：
 
 1. 单次回复只需携带工具参数，不再重述完整节点，输出长度大幅下降
 2. 消息时间线 append-only，schema 只在会话开头出现一次，可稳定命中前缀缓存
 
+#### Agent 批量编辑工具 `batch_edit`
+
+默认提供，无需新增配置。参数 `operations` 是非空数组，每项包含 `tool`（单项编辑工具名）和 `arguments`（该工具原有参数）。支持跨条目混合 `upsert_entry`、`set_fields`、`append_items`；开启 `tools.allow_remove` 后还支持 `remove_field`、`remove_entry`。读取工具和嵌套 `batch_edit` 不参与批量编辑。
+
+例如一次调用中新建条目、修改字段并追加关键词：
+
+```json
+{
+  "operations": [
+    {"tool": "upsert_entry", "arguments": {"key": "Alice", "node": {"name": {"romaji": "Alice"}, "trigger_keywords": ["Alice"], "basic_settings": {"age": 19}}}},
+    {"tool": "set_fields", "arguments": {"key": "Alice", "path": "basic_settings.age", "value": 20}},
+    {"tool": "append_items", "arguments": {"key": "Alice", "path": "trigger_keywords", "items": ["爱丽丝"]}}
+  ]
+}
+```
+
+- **顺序执行**：后面的操作可以使用前面新建的条目或字段。
+- **原子提交**：只读取一次文档，复用单项工具的校验、去重与删除开关；全部操作成功后统一写入一次，journal 仍逐项记录。
+- **失败整批不生效**：返回从 `0` 开始的 `error.failed_index` 和 `error.operation_error`，文档及 journal 保持原样。修正错误后重发**完整批次**，而不是只重发失败项。
+- **统计不丢失**：成功结果包含 `edit_count` 和逐项 `results`，段落的编辑数按批内操作数累计。
+
 #### `session.max_context_tokens`
 上下文预算。累计 prompt token 超过该值后，会话开启新一轮 generation：保留不变的 system 块（人设与 schema），重建实体索引摘要与进度水位。设置为 `0` 或负数表示不旋转，仅适合短文本调试。
 
 #### `session.max_tool_rounds_per_segment`
-单个段落允许的最大工具调用轮数。超过该值即视为段落失败，不会推进 `last_completed_chapter_index`。
+单个段落允许的最大模型往返轮数，包含最后不带工具调用的完成回复。超过该值即视为段落失败，不会推进 `last_completed_chapter_index`。`batch_edit` 内的操作不单独占用轮数：例如一次批量提交 20 项编辑，再回复「本段完成」，共占 2 轮。
 
 #### `session.rotate_on_checkpoint`
 是否让上下文旋转与 checkpoint 窗口对齐。对齐后旋转点可复现、可回滚；若 token 数超过硬上限（预算的 1.5 倍）则立即旋转，不再等待边界。

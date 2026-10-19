@@ -129,6 +129,7 @@ class ScriptedModelClient:
         self.script = list(script)
         self.requests: list[list[dict[str, Any]]] = []
         self.tools_seen: list[int] = []
+        self.tool_names_seen: list[set[str]] = []
 
     async def stream_yaml(self, prompt: str):
         if False:
@@ -138,6 +139,7 @@ class ScriptedModelClient:
         # 深拷贝快照，模拟真实请求序列化边界
         self.requests.append(json.loads(json.dumps(messages, ensure_ascii=False)))
         self.tools_seen.append(len(tools))
+        self.tool_names_seen.append({item["function"]["name"] for item in tools})
         if not self.script:
             return ToolCompletion(turn=AssistantTurn(content="noop"), finish_reason="stop")
         turn = self.script.pop(0)
@@ -149,6 +151,19 @@ def tool_turn(call_id: str, name: str, arguments: dict[str, Any]) -> AssistantTu
     return AssistantTurn(
         tool_calls=[ToolCall(id=call_id, name=name, arguments=json.dumps(arguments, ensure_ascii=False))]
     )
+
+def upsert_operations(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "tool": "upsert_entry",
+            "arguments": {
+                "key": f"Char{index:04d}",
+                "node": {"name": {"romaji": f"Char{index:04d}"}, "trigger_keywords": [f"Char{index:04d}"]},
+            },
+        }
+        for index in range(count)
+    ]
+
 
 def build_batch(start: int = 1, end: int = 2) -> ChapterBatch:
     chapters = [
@@ -220,6 +235,8 @@ class PersonaTests(unittest.TestCase):
 
         self.assertIn("actors", text)
         self.assertIn("upsert_entry", text)
+        self.assertIn("batch_edit", text)
+        self.assertIn("failed_index", text)
         self.assertIn("禁止中文 key", text)
 
     def test_persona_is_deterministic(self) -> None:
@@ -264,6 +281,95 @@ class SegmentLoopTests(unittest.TestCase):
             self.assertEqual(result.edit_count, 1)
             stored = YamlStore().load_yaml(task.output_path)
             self.assertIn("Alice", stored["actors"])
+
+    def test_batch_of_twenty_edits_completes_with_two_round_budget(self) -> None:
+        client = ScriptedModelClient([
+            tool_turn("batch1", "batch_edit", {"operations": upsert_operations(20)}),
+            AssistantTurn(content="本段完成"),
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner, task = build_runner(temp_dir, client, session=SessionConfig(max_tool_rounds_per_segment=2))
+            runner.ensure_session(total_chapters=2, last_completed_chapter_index=0)
+
+            result = asyncio.run(runner.run_segment(build_batch(), source_text="正文", total_chapters=2))
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(result.tool_rounds, 2)
+            self.assertEqual(result.edit_count, 20)
+            self.assertEqual(result.error_count, 0)
+            self.assertEqual(len(client.requests), 2)
+            self.assertTrue(all("batch_edit" in names for names in client.tool_names_seen))
+            self.assertEqual(len(YamlStore().load_yaml(task.output_path)["actors"]), 20)
+            self.assertEqual(runner.session.last_segment_end_chapter, 2)
+            tool_messages = [message for message in runner.session.messages if message["role"] == "tool"]
+            self.assertEqual(len(tool_messages), 1)
+            self.assertEqual(tool_messages[0]["tool_call_id"], "batch1")
+            self.assertEqual(json.loads(tool_messages[0]["content"])["edit_count"], 20)
+            self.assertEqual(client.requests[1][:len(client.requests[0])], client.requests[0])
+
+    def test_separate_edits_still_exhaust_the_same_two_round_budget(self) -> None:
+        operations = upsert_operations(20)
+        client = ScriptedModelClient([
+            tool_turn(f"c{index}", operation["tool"], operation["arguments"])
+            for index, operation in enumerate(operations)
+        ] + [AssistantTurn(content="本段完成")])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner, _ = build_runner(temp_dir, client, session=SessionConfig(max_tool_rounds_per_segment=2))
+            runner.ensure_session(total_chapters=2, last_completed_chapter_index=0)
+
+            result = asyncio.run(runner.run_segment(build_batch(), source_text="正文", total_chapters=2))
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.tool_rounds, 2)
+            self.assertEqual(result.edit_count, 2)
+            self.assertEqual(len(client.requests), 2)
+            self.assertEqual(runner.session.last_segment_end_chapter, 0)
+            self.assertIn("上限", result.reason)
+
+    def test_failed_batch_does_not_count_staged_edits_or_advance_progress(self) -> None:
+        operations = upsert_operations(2)
+        operations[1]["arguments"]["node"]["bogus_field"] = "x"
+        client = ScriptedModelClient([
+            tool_turn("batch1", "batch_edit", {"operations": operations}),
+            AssistantTurn(content="本段完成"),
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner, task = build_runner(temp_dir, client)
+            runner.ensure_session(total_chapters=2, last_completed_chapter_index=0)
+
+            result = asyncio.run(runner.run_segment(build_batch(), source_text="正文", total_chapters=2))
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.edit_count, 0)
+            self.assertEqual(result.error_count, 1)
+            self.assertEqual(runner.session.last_segment_end_chapter, 0)
+            self.assertEqual(YamlStore().load_yaml(task.output_path)["actors"], {})
+            tool_messages = [message for message in runner.session.messages if message["role"] == "tool"]
+            error = json.loads(tool_messages[0]["content"])["error"]
+            self.assertEqual(error["failed_index"], 1)
+            self.assertEqual(error["operation_error"]["code"], "schema_violation")
+
+    def test_failed_batch_can_be_resubmitted_without_double_counting(self) -> None:
+        invalid = upsert_operations(2)
+        invalid[1]["arguments"]["node"]["bogus_field"] = "x"
+        client = ScriptedModelClient([
+            tool_turn("batch1", "batch_edit", {"operations": invalid}),
+            tool_turn("batch2", "batch_edit", {"operations": upsert_operations(2)}),
+            AssistantTurn(content="本段完成"),
+        ])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runner, task = build_runner(temp_dir, client, session=SessionConfig(max_tool_rounds_per_segment=3))
+            runner.ensure_session(total_chapters=2, last_completed_chapter_index=0)
+
+            result = asyncio.run(runner.run_segment(build_batch(), source_text="正文", total_chapters=2))
+
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(result.tool_rounds, 3)
+            self.assertEqual(result.edit_count, 2)
+            self.assertEqual(result.error_count, 1)
+            self.assertEqual(len(YamlStore().load_yaml(task.output_path)["actors"]), 2)
+            journal_path = task.workspace.journal_path_for_schema("characters")
+            self.assertEqual(len(journal_path.read_text(encoding="utf-8").splitlines()), 2)
 
     def test_read_only_segment_counts_as_no_edit(self) -> None:
         """只读不写视为空转，避免模型用 read_entry 假装完成。"""

@@ -64,7 +64,7 @@ batching:
 
 # 抽取管线模式
 #   legacy: 让 LLM 输出完整 YAML，由程序侧合并（旧行为，未设置时的默认值）
-#   agent : 提供编辑工具，由 LLM 逐字段修改 output.yaml（推荐，见下）
+#   agent : 提供 batch_edit 等编辑工具，由 LLM 批量修改 output.yaml（推荐，见下）
 pipeline:
   mode: legacy
 
@@ -73,7 +73,8 @@ session:
   enabled: true
   # 上下文预算，超过后开启新一轮 generation（0 或负数表示不旋转）
   max_context_tokens: 64000
-  # 单个段落允许的最大工具调用轮数，超过即视为段落失败
+  # 单个段落允许的最大模型往返轮数（含完成回复），超过即视为段落失败
+  # batch_edit 内的多项编辑只占一次工具调用，不逐项消耗轮数
   max_tool_rounds_per_segment: 12
   # 旋转点与 checkpoint 窗口对齐（超出硬上限时会立即旋转）
   rotate_on_checkpoint: true
